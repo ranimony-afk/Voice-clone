@@ -1,0 +1,6 @@
+{
+  "name": "VoiceForge AI Voice Platform",
+  "description": "Production-grade multilingual AI voice platform featuring expressive TTS, zero-shot voice cloning, and text front-ends for English, Tamil, Hindi, Malayalam, and Japanese.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
