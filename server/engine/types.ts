@@ -2,7 +2,7 @@
  * VoiceForge Core Types & Pluggable Engine Contracts
  */
 
-export type SupportedLanguage = 'en' | 'hi' | 'ta' | 'ml' | 'ja';
+export type SupportedLanguage = 'en' | 'hi' | 'ta' | 'ml' | 'ja' | 'es' | 'fr' | 'de';
 
 export type VoiceCategory = 'premade' | 'cloned_instant' | 'cloned_professional' | 'designed';
 
@@ -74,6 +74,9 @@ export interface SynthesisResponse {
   generationTimeMs: number;
   watermarkSignature: string;
   phonemes: string;
+  engineUsed?: string;
+  isNeural?: boolean;
+  provenanceHash?: string;
 }
 
 export interface ConsentVerificationRequest {
@@ -90,4 +93,22 @@ export interface ConsentVerificationResponse {
   voiceId?: string;
   message: string;
   auditHash: string;
+}
+
+export interface DictionaryEntry {
+  id: string;
+  word: string;
+  language: SupportedLanguage | 'all';
+  ipa: string;
+  alias?: string;
+  notes?: string;
+  createdAt: string;
+}
+
+export interface WordPhonemeItem {
+  word: string;
+  ipa: string;
+  language: SupportedLanguage;
+  isOverridden: boolean;
+  dictionaryId?: string;
 }

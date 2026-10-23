@@ -148,6 +148,15 @@ export class TextNormalizer {
       });
     }
 
+    // Time expressions (e.g. 2:30pm -> two thirty pm, 10:15 -> ten fifteen)
+    out = out.replace(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/gi, (_, hours, mins, ampm) => {
+      notes.push('Expanded time format to spoken words');
+      const h = this.numberToEnglishWords(parseInt(hours, 10));
+      const m = parseInt(mins, 10) === 0 ? "o'clock" : this.numberToEnglishWords(parseInt(mins, 10));
+      const suffix = ampm ? ` ${ampm.toLowerCase()}` : '';
+      return `${h} ${m}${suffix}`;
+    });
+
     // Abbreviations
     const abbrMap: Record<string, string> = {
       'Dr\\.': 'Doctor',

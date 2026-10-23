@@ -169,8 +169,12 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
                   <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono-code uppercase">
                     {voice.primaryLanguage}
                   </span>
-                  <span className="text-indigo-400 capitalize font-medium">
-                    {voice.category.replace('_', ' ')}
+                  <span className={`capitalize font-semibold ${
+                    voice.category.includes('clone')
+                      ? 'text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20'
+                      : 'text-indigo-400'
+                  }`}>
+                    {voice.category.includes('clone') ? '⭐ Cloned Voice' : voice.category.replace('_', ' ')}
                   </span>
                 </div>
               </button>

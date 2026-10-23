@@ -10,12 +10,20 @@ import { PhoneticLabView } from './components/PhoneticLabView.tsx';
 import { TTSStudioView } from './components/TTSStudioView.tsx';
 import { VoiceCloningLabView } from './components/VoiceCloningLabView.tsx';
 import { ApiReferenceView } from './components/ApiReferenceView.tsx';
+import { MusicStudioView } from './components/MusicStudioView.tsx';
+import { ImageStudioView } from './components/ImageStudioView.tsx';
+import { VideoStudioView } from './components/VideoStudioView.tsx';
+import { LiveConversationView } from './components/LiveConversationView.tsx';
+import { VoiceStudioSuiteView } from './components/VoiceStudioSuiteView.tsx';
+import { BillingDashboard } from './components/BillingDashboard.tsx';
+import { MediaTranscribeTranslateView } from './components/MediaTranscribeTranslateView.tsx';
+import { ShotcutEditorView } from './components/ShotcutEditorView.tsx';
 import { DEFAULT_VOICES } from '../server/data/voices.ts';
 import { VoiceProfile } from '../server/engine/types.ts';
-import { Shield, Sparkles, CheckCircle2 } from 'lucide-react';
+import { Shield, CheckCircle2 } from 'lucide-react';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<string>('arch');
+  const [activeTab, setActiveTab] = useState<string>('tts');
   const [voices, setVoices] = useState<VoiceProfile[]>(DEFAULT_VOICES);
 
   // Fetch registered voices from server
@@ -34,10 +42,6 @@ export default function App() {
 
   const handleVoiceCreated = (newVoice: VoiceProfile) => {
     setVoices((prev) => [newVoice, ...prev]);
-    // Switch to TTS playground to let user immediately test their newly created voice
-    setTimeout(() => {
-      setActiveTab('tts');
-    }, 1200);
   };
 
   return (
@@ -50,14 +54,30 @@ export default function App() {
       />
 
       {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 pb-16">
-        {activeTab === 'arch' && <ArchitectureView />}
-        {activeTab === 'phonetics' && <PhoneticLabView />}
+      <main className={`flex-1 w-full ${activeTab === 'shotcut' ? 'max-w-none px-0 pb-0' : 'max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-16'}`}>
+        {activeTab === 'shotcut' && <ShotcutEditorView />}
         {activeTab === 'tts' && <TTSStudioView voices={voices} />}
         {activeTab === 'cloning' && (
-          <VoiceCloningLabView onVoiceCreated={handleVoiceCreated} />
+          <VoiceCloningLabView
+            onVoiceCreated={handleVoiceCreated}
+            voices={voices}
+            onOpenTts={() => setActiveTab('tts')}
+          />
         )}
+        {activeTab === 'transcribe' && (
+          <MediaTranscribeTranslateView voices={voices} />
+        )}
+        {activeTab === 'voicestudio' && (
+          <VoiceStudioSuiteView voices={voices} onVoiceDesigned={handleVoiceCreated} />
+        )}
+        {activeTab === 'music' && <MusicStudioView />}
+        {activeTab === 'images' && <ImageStudioView />}
+        {activeTab === 'videos' && <VideoStudioView />}
+        {activeTab === 'live' && <LiveConversationView />}
+        {activeTab === 'phonetics' && <PhoneticLabView />}
+        {activeTab === 'arch' && <ArchitectureView />}
         {activeTab === 'api' && <ApiReferenceView />}
+        {activeTab === 'billing' && <BillingDashboard />}
       </main>
 
       {/* Bottom Compliance & System Footer */}
@@ -65,7 +85,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
-            <span className="font-medium text-slate-400">VoiceForge v1.0.0 (Phase 0 Architecture Engine)</span>
+            <span className="font-medium text-slate-400">VoiceForge Studio v1.5 (Multilingual TTS, Lyria, Veo & Gemini Live)</span>
           </div>
 
           <div className="flex items-center gap-4 text-[11px]">
