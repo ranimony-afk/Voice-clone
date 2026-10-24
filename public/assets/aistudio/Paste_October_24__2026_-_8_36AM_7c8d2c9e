@@ -1,0 +1,790 @@
+# MASTER ENGINEERING PROMPT
+# VoiceForge 2.0 — Fresh Gemini Session: Clone, Audit, Integrate, Build, and Verify OmniVoice + Creative Video Studio
+
+> **Use this as the first and authoritative prompt in a new Gemini AI coding session.**
+> Start from the actual repository state and tools available in that session. Do not rely on prior Gemini chats, ChatGPT conversations, memory, undocumented assumptions, or claims from earlier runs. Re-discover and verify every repository, branch, file, dependency, license, and test result from the current environment.
+
+You are acting as a coordinated team of senior software architects, full-stack engineers, ML inference engineers, audio DSP engineers, motion-graphics developers, DevOps engineers, QA specialists and application-security reviewers.
+
+Your task is to start at the beginning of this session, clone and inspect the authoritative VoiceForge application plus both upstream repositories, then integrate the genuine OmniVoice inference engine and use the video repository as a properly licensed creative reference to build a real, tested, deployable, multilingual AI voice and creative-media platform.
+
+**Do not simply redesign the interface. Clone the repositories, inspect the actual source, implement working functionality, run the available build/test commands, and report evidence.**
+
+## 0. Fresh Gemini session bootstrap — mandatory first actions
+
+Treat this as a new engineering engagement. Assume no prior work has been performed unless it is verified in the current session.
+
+### 0.1 Establish what environment Gemini actually has
+
+Before changing files, report:
+- Current date/time if available, operating system, shell, current directory, and available runtimes/tools.
+- Whether this session has a real terminal, filesystem, Git, network access, and permission to write files.
+- Whether GitHub authentication is available and which operations are authorized. Never print tokens or credentials.
+- Whether the current directory already contains a repository. If so, identify it before running any clone command.
+- Available CPU, RAM, disk space, Python version, Node version, package managers, Docker availability, and whether NVIDIA/CUDA/GPU is present. If a capability cannot be checked, say so.
+
+Do not claim to have cloned, built, tested, or deployed anything until the operation actually ran and its output was observed.
+
+### 0.2 Establish a safe workspace and source-of-truth policy
+
+- Use a new, clearly named workspace directory only if the current environment permits it and it does not overwrite existing user files.
+- If the workspace already exists, inspect it first. Never delete it or overwrite its contents to make cloning easier.
+- The VoiceForge repository is the application source of truth. OmniVoice is the upstream speech-engine source. The video repository is a reference collection, not a video-generation model or a substitute application.
+- Do not copy external repositories wholesale into the application repository without an explicit architecture decision.
+- Do not assume that a local folder, Git remote, ignored directory, cached model, previous test report, or deployment exists. Verify it in this session.
+- Do not use destructive commands such as `rm -rf`, `git reset --hard`, `git clean -fdx`, forced checkout, or forced push.
+- Do not expose `.env` contents, credentials, private keys, access tokens, private audio, or other secrets in terminal output or reports.
+
+### 0.3 Clone all three repositories from the start
+
+Use a new workspace directory, for example `voiceforge-work/`, after verifying the target path does not already exist or contain user work. Clone the repositories into separate directories:
+
+```bash
+git clone https://github.com/ranimony-afk/Voice-clone.git Voice-clone
+git clone https://github.com/k2-fsa/OmniVoice.git OmniVoice
+git clone https://github.com/yihui-dev/awesome-opus5-5-videos.git awesome-opus5-5-videos
+```
+
+Run these commands from the new workspace parent directory, not from inside an existing Git repository. If the destination already exists, stop and inspect rather than overwrite it. If network/authentication/policy prevents a clone, report the exact blocker and continue only with safe read-only work possible in the current checkout.
+
+For each clone, record:
+- Remote URL and default branch.
+- Checked-out branch and exact HEAD commit SHA.
+- Working-tree status.
+- Latest commit date/subject.
+- Whether the checkout is shallow.
+- License-file paths and any submodules or large-file mechanisms.
+
+Verify remote identity before trusting repository contents. Do not fetch, switch branches, or update existing checkouts without checking current state and authorization first.
+
+### 0.4 Create a baseline before integration
+
+Before editing:
+1. Inventory top-level files and important source/config/test directories in all three repositories.
+2. Read READMEs, license notices, model-card/weight terms, dependency manifests, inference examples, CI workflows, and test instructions.
+3. Record baseline build/test outcomes for VoiceForge where dependencies and environment permit.
+4. Capture a machine-readable file/commit manifest and a concise human-readable baseline report.
+5. Record disk usage and whether model weights are present; do not download large weights until their license, size, storage requirements, and the user's resource constraints are assessed.
+6. Identify which checks need GPU, external credentials, a database, private storage, or paid services.
+7. Preserve the pristine upstream clones. Perform integration in the VoiceForge working copy or a separate integration branch/worktree only when allowed by the environment. Never mix application changes into the upstream clones.
+
+### 0.5 Work in evidence-backed gates
+
+Complete M0 and present its evidence before broad implementation. Continue with the smallest safe, testable milestone. If the session is interrupted or context becomes limited, update a checkpoint report with exact commit SHAs, changed paths, commands/results, blockers, and the next safe action. On resumption, re-check repository identity and working-tree status before continuing.
+
+Do not pretend a long-running command succeeded if its output was truncated or missing. If a tool cannot perform a required operation, provide a precise manual command or stop at the blocked gate.
+
+---
+
+## 1. Authoritative repositories
+
+Primary application:
+
+https://github.com/ranimony-afk/Voice-clone
+
+Upstream speech engine:
+
+https://github.com/k2-fsa/OmniVoice
+
+Creative video and animation reference collection:
+
+https://github.com/yihui-dev/awesome-opus5-5-videos
+
+The VoiceForge repository is the authoritative application. The two external repositories are dependencies/references, not replacements for the primary application.
+
+Inspect the current repository and gate state before modifying anything.
+
+### Initial operating rules
+
+1. Print the current working directory, Git remote, branch, HEAD SHA, working-tree status and unpushed commits.
+2. Inspect all existing application code, documentation, configuration and tests.
+3. Record the exact upstream commit SHAs for both external repositories.
+4. Preserve existing work and user changes.
+5. Do not overwrite or discard uncommitted changes.
+6. Work on a dedicated feature branch only if the current environment permits branch creation and the user has authorized it; otherwise stay in the permitted checkout and do not bypass restrictions.
+7. Do not push, merge, deploy, modify production data or incur paid infrastructure charges without explicit authorization.
+8. Never claim a test passed unless it actually ran.
+9. Never label a simulated feature as production-ready.
+10. Do not silently substitute an unrelated model or API for OmniVoice.
+
+Produce an initial architecture and gap report before implementation.
+
+---
+
+## 2. Clone and inspect the external repositories
+
+The fresh-session bootstrap above clones both upstream repositories as separate sibling directories beside `Voice-clone`. Keep those pristine clones available for source inspection. If the final architecture requires vendoring a small adapter or curated metadata, copy only the minimum necessary files and preserve notices; do not nest full Git repositories inside VoiceForge by default.
+
+If a separately authorized integration checkout is used, document its branch/commit and why it is safe. Do not create branches or worktrees when the environment prohibits them.
+
+Then:
+
+- Record exact commit SHAs.
+- Read both READMEs.
+- Read both LICENSE files.
+- Inspect OmniVoice's pyproject.toml, inference API, model-loading requirements, CLI and documentation.
+- Inspect the video collection's data structure, prompts, credits and original source links.
+- Create THIRD_PARTY_INVENTORY.md.
+- Document licenses, notices, dependencies, model-weight restrictions, media rights and attribution requirements.
+
+Do not automatically commit entire upstream histories or large model files into VoiceForge.
+
+Decide whether pinned dependencies, Git submodules or a separately versioned inference image are most maintainable.
+
+Use a dependency lock and reproducible version references.
+
+**Licensing gate:** OmniVoice source declares Apache-2.0 and the video collection declares MIT. Independently verify model-weight terms, datasets, dependencies, external videos and creator-owned content. Do not assume a repository license grants ownership of every linked asset.
+
+---
+
+## 3. Correct the existing VoiceForge proof-of-concept problems
+
+Audit and repair the current implementation before expanding its scope.
+
+The existing application has previously exhibited the following issues; revalidate them against the current HEAD:
+
+- Speech output generated by a handcrafted waveform synthesizer instead of genuine neural inference.
+- Voice cloning and consent flows using simulated values.
+- Upload and microphone controls that do not process actual recordings.
+- Random or fabricated audio-quality metrics.
+- A watermark-verification mechanism that does not inspect actual embedded audio provenance.
+- Process-local voice storage instead of persistent records.
+- No established authentication, authorization or ownership controls.
+- Incomplete input validation and abuse prevention.
+- Frontend-only build behavior without a verified production backend build.
+- Missing automated tests and CI.
+- Aspirational documentation describing features that may not actually exist.
+
+Replace simulations with real implementations or explicitly disable them behind clearly labeled development-only feature flags.
+
+No fake biometric verification, fabricated audio-quality results, fake billing or misleading health checks.
+
+Unknown voice IDs must produce an appropriate error rather than silently selecting another voice.
+
+---
+
+## 4. Implement OmniVoice as the primary speech engine
+
+Build an independently deployable Python inference service.
+
+Recommended location:
+
+```text
+services/
+  omnivoice/
+    app/
+      main.py
+      config.py
+      model_manager.py
+      inference.py
+      schemas.py
+      audio_processing.py
+      safety.py
+    tests/
+    Dockerfile
+    pyproject.toml
+```
+
+Use the actual documented OmniVoice API.
+
+Its README demonstrates loading the model with:
+
+```python
+from omnivoice import OmniVoice
+import torch
+
+model = OmniVoice.from_pretrained(
+    "k2-fsa/OmniVoice",
+    device_map="cuda:0",
+    dtype=torch.float16
+)
+```
+
+It also documents generation using text, reference audio, reference transcription and optional voice-design instructions.
+
+Implement:
+
+### A. Standard text-to-speech
+
+- Text input.
+- Language selection.
+- Automatic voice mode.
+- Genuine neural speech generation.
+- WAV output.
+- Accurate sample rate and duration.
+- Input-length limits.
+- Text normalization.
+- Error handling and job cancellation.
+- Audio preview and download.
+
+### B. Voice cloning
+
+- Actual reference-audio upload.
+- Browser microphone recording.
+- Server-side audio decoding and validation.
+- Duration, silence, clipping and signal-quality checks.
+- Optional reference transcription.
+- Whisper-based transcription where supported.
+- Creation of reusable voice-clone prompts using the documented OmniVoice mechanism.
+- Secure storage of reusable prompts.
+- Voice preview.
+- Voice deletion and consent revocation.
+
+Follow upstream recommendations for short reference clips. Make limits configurable and validate empirically.
+
+### C. Voice design
+
+Support documented voice-design attributes through a structured interface.
+
+Examples:
+
+- Pitch.
+- Age/style descriptors.
+- Supported accent options.
+- Whisper-style output.
+- Natural-language voice instruction.
+
+Clearly distinguish stable supported controls from experimental ones.
+
+The upstream documentation says voice design is primarily trained for Chinese and English. Do not promise equivalent behavior across all supported synthesis languages.
+
+### D. Advanced synthesis
+
+Where supported by the actual upstream API:
+
+- Generation-step configuration.
+- Speed control.
+- Fixed duration.
+- Pronunciation correction.
+- Non-verbal expressions.
+- Batch inference.
+- Model warm-up.
+- GPU memory management.
+- Optional inference acceleration.
+
+Validate each option against the installed upstream version.
+
+Do not invent unsupported OmniVoice parameters.
+
+### E. Model and hardware handling
+
+Provide:
+
+- CPU/GPU capability detection.
+- NVIDIA CUDA configuration.
+- Optional Apple Silicon development guidance.
+- Model download/cache management.
+- Explicit model version pinning.
+- GPU memory and concurrency limits.
+- Graceful unavailable-model errors.
+- Separate lightweight CI tests and GPU integration tests.
+
+Do not load the model on every request.
+
+Do not place the GPU inference workload inside a Vercel serverless function.
+
+---
+
+## 5. Build a real VoiceForge API and job system
+
+Preserve the existing React application where practical.
+
+Create a clean separation between:
+
+1. Browser/frontend.
+2. Application API.
+3. Background job queue.
+4. OmniVoice inference service.
+5. Persistent database.
+6. Private object storage.
+7. Creative video rendering service.
+
+Define versioned API contracts.
+
+Suggested endpoints:
+
+```text
+GET    /api/v1/health/live
+GET    /api/v1/health/ready
+
+GET    /api/v1/voices
+POST   /api/v1/voices
+GET    /api/v1/voices/:id
+DELETE /api/v1/voices/:id
+
+POST   /api/v1/audio/reference
+POST   /api/v1/voices/clone
+POST   /api/v1/tts/jobs
+
+GET    /api/v1/jobs/:id
+POST   /api/v1/jobs/:id/cancel
+
+GET    /api/v1/projects
+POST   /api/v1/projects
+GET    /api/v1/projects/:id
+
+POST   /api/v1/visuals/projects
+POST   /api/v1/visuals/render
+```
+
+These are proposed application contracts, not claimed existing OmniVoice endpoints.
+
+Implement:
+
+- Strict request schemas.
+- Authenticated resource ownership.
+- Request IDs.
+- Structured error responses.
+- Idempotency keys for job creation.
+- Retry-safe job execution.
+- Rate limiting.
+- File-type and size restrictions.
+- Signed upload/download URLs.
+- Durable job status.
+- Accurate resource usage accounting.
+- Auditable generation metadata.
+
+Store binary media in private object storage, not directly in relational database rows.
+
+---
+
+## 6. Implement a genuine consent and voice-safety workflow
+
+Voice cloning is disabled by default until the safety gate passes.
+
+Require affirmative authorization to use the reference voice.
+
+Build:
+
+- Explicit consent collection.
+- Evidence recording and retention policy.
+- Consent timestamp and version.
+- User/voice ownership association.
+- Deletion and revocation workflow.
+- Prohibition of unauthorized third-party impersonation.
+- Abuse-reporting controls.
+- Administrator review where appropriate.
+- Rate limits and suspicious-use monitoring.
+- Protection of reference recordings and reusable voice prompts.
+
+If implementing voice verification, use a real validated verification pipeline with measured false-acceptance and false-rejection behavior.
+
+A similarity score alone must not be presented as legal proof of consent.
+
+Do not implement verification by generating random scores or accepting placeholder recordings.
+
+Provide a provenance strategy for generated media. Evaluate actual audio watermarking or signed metadata and document its limitations. Never call a signature-length check watermark verification.
+
+---
+
+## 7. Use the video repository to create VoiceForge Visual Studio
+
+Treat awesome-opus5-5-videos as a creative reference collection, not a drop-in video-generation model.
+
+Study its categories, coded animation approaches, prompt patterns and attribution.
+
+Build an original VoiceForge Visual Studio with:
+
+### Audio-reactive visualization
+
+- Live waveform.
+- Frequency spectrum.
+- Spectrogram.
+- Animated subtitles.
+- Voice activity indicators.
+- Audio-responsive particles.
+- Timeline and playback synchronization.
+
+### Motion graphics
+
+Use appropriate browser technologies:
+
+- SVG.
+- Canvas.
+- CSS animation.
+- Web Audio API.
+- Optional GSAP.
+- Optional Three.js/WebGL where justified.
+
+Avoid unnecessary heavy dependencies.
+
+### Creative video templates
+
+Build original templates for:
+
+1. Audiogram/social-media clips.
+2. Podcast visualizers.
+3. Narrated explainers.
+4. Kinetic typography.
+5. Product narration.
+6. Educational language videos.
+7. Multilingual subtitles.
+8. Voice-driven motion graphics.
+
+Allow users to combine generated OmniVoice narration with these visual templates.
+
+### Video editor
+
+Implement:
+
+- Project creation.
+- Narration track.
+- Scene timeline.
+- Text overlays.
+- Captions.
+- Background selection.
+- Aspect ratios 16:9, 9:16 and 1:1.
+- Scene duration.
+- Audio synchronization.
+- Preview.
+- Export progress.
+- Download.
+
+Use a real rendering pipeline, such as a suitable browser/video-rendering framework and FFmpeg worker.
+
+Do not label a static image or nonfunctional preview as a completed video export.
+
+### Rights and attribution
+
+Do not bulk republish the external collection's creator videos, thumbnails or other media without verifying permission.
+
+Do not clone Skillry's branding, website or proprietary presentation.
+
+Use the collection for inspiration, research and properly attributed references. Produce original VoiceForge implementations.
+
+---
+
+## 8. Design the VoiceForge interface
+
+Create a cohesive, accessible application rather than unrelated demo screens.
+
+Required navigation:
+
+- Dashboard.
+- Text-to-Speech Studio.
+- Voice Library.
+- Voice Cloning Lab.
+- Voice Design.
+- Visual Studio.
+- Projects.
+- Render Queue.
+- Developer API.
+- Account & Privacy.
+- Administration.
+
+### TTS Studio
+
+Provide a functional workflow:
+
+Enter text → choose language → choose authorized voice → configure synthesis → generate → preview → save/download.
+
+### Voice Cloning Lab
+
+Provide a functional workflow:
+
+Consent → record/upload → inspect real audio → transcribe → validate → create voice prompt → generate preview → save securely.
+
+### Visual Studio
+
+Provide a functional workflow:
+
+Choose narration → select original visual template → edit timeline → preview → render → export.
+
+Include loading, error, empty, unavailable-GPU, cancellation and retry states.
+
+Support keyboard navigation, screen-reader labels and reduced-motion preferences.
+
+---
+
+## 9. Database and storage design
+
+Create migrations for the minimum required persistent entities:
+
+- users
+- sessions
+- projects
+- voices
+- voice_reference_assets
+- voice_clone_prompts
+- consent_records
+- synthesis_jobs
+- generated_audio
+- visual_projects
+- visual_scenes
+- render_jobs
+- media_assets
+- audit_events
+- usage_records
+
+Define foreign keys, indexes, uniqueness constraints, ownership rules and deletion behavior.
+
+Ensure revoking a voice prevents further synthesis with its stored prompt.
+
+Document media-retention and backup policies.
+
+Use environment variables and secret management. Never commit credentials or private recordings.
+
+---
+
+## 10. Testing requirements
+
+Create automated tests at multiple levels.
+
+### Frontend
+
+Use a suitable React test framework and browser E2E tests.
+
+Verify:
+
+- Form validation.
+- Recording permissions.
+- Upload handling.
+- Audio playback.
+- Voice selection.
+- Job status.
+- Error states.
+- Project saving.
+- Video timeline controls.
+- Accessibility.
+
+### API
+
+Test:
+
+- Authentication.
+- Authorization.
+- Ownership boundaries.
+- Validation.
+- File restrictions.
+- Job lifecycle.
+- Idempotency.
+- Rate limits.
+- Cancellation.
+- Revocation.
+- Malformed requests.
+
+### Python inference
+
+Use pytest.
+
+Include:
+
+- Model-adapter unit tests with mocks.
+- Audio preprocessing tests.
+- Reference-audio validation.
+- Correct WAV encoding.
+- Sample-rate verification.
+- Duration accuracy.
+- Invalid parameter handling.
+- Model unavailable behavior.
+- GPU integration tests where hardware is available.
+
+### End-to-end
+
+Verify at least these real workflows:
+
+1. Standard TTS generation.
+2. Authorized voice cloning.
+3. Voice-design synthesis.
+4. Saving and reusing a voice.
+5. Revoking a voice.
+6. Generating an audiogram.
+7. Rendering and downloading a playable video.
+
+Test real generated outputs rather than merely checking for HTTP 200.
+
+Include representative multilingual evaluation samples, including English, Tamil, Hindi and Japanese, subject to upstream language support and empirical quality testing.
+
+Report failures and limitations accurately.
+
+---
+
+## 11. Deployment and cost architecture
+
+Prioritize a low-cost, scalable deployment.
+
+Suggested separation:
+
+- Static/frontend hosting.
+- Persistent application API.
+- PostgreSQL.
+- Private S3-compatible object storage.
+- Background queue.
+- On-demand GPU inference worker.
+- Separate video-render worker where required.
+
+Provide local Docker Compose development with infrastructure services.
+
+Do not require paid GPU access for ordinary frontend/API CI.
+
+Create:
+
+- Dockerfiles.
+- Health/readiness probes.
+- Environment templates.
+- Database migrations.
+- Dependency lockfiles.
+- GitHub Actions CI.
+- Deployment instructions.
+- Backup and restore instructions.
+- Cost estimates and usage limits.
+
+Verify the production build actually starts.
+
+Do not use `node server.ts` as a production startup command unless the runtime explicitly supports that TypeScript execution path.
+
+---
+
+## 12. Security and operational requirements
+
+Implement:
+
+- Authentication and authorization.
+- HTTPS-compatible deployment.
+- Secure headers.
+- CORS restrictions.
+- Upload validation.
+- Private media access.
+- Secret handling.
+- Dependency vulnerability checks.
+- Audit logging.
+- Privacy-safe telemetry.
+- Error monitoring.
+- Request and job tracing.
+- Resource quotas.
+- GPU concurrency controls.
+- Abuse-response procedures.
+- Deletion and retention workflows.
+
+Avoid logging private reference-audio content, raw credentials or sensitive voice prompts.
+
+Document known residual risks.
+
+---
+
+## 13. Required documentation
+
+Create or update:
+
+```text
+README.md
+ARCHITECTURE.md
+THIRD_PARTY_INVENTORY.md
+MODEL_AND_MEDIA_LICENSES.md
+API.md
+DATABASE.md
+LOCAL_DEVELOPMENT.md
+DEPLOYMENT.md
+SECURITY.md
+VOICE_CONSENT_POLICY.md
+TEST_PLAN.md
+EVALUATION_REPORT.md
+RELEASE_READINESS.md
+```
+
+Keep documentation synchronized with the implemented code.
+
+Distinguish clearly between:
+
+- Implemented and tested.
+- Implemented but unverified.
+- Experimental.
+- Planned.
+- Blocked.
+
+---
+
+## 14. Execute in controlled milestones
+
+Do not attempt a giant unverified rewrite. The session starts with M0; do not skip directly to implementation. After each milestone, report evidence and blockers, then continue only when the gate is satisfied and the environment permits the next step. Do not pause after merely writing a plan if the authorized environment allows the next safe milestone; equally, do not bypass a failed gate to maintain momentum.
+
+### M0 — Repository and upstream audit
+Deliver repository identities, license matrix, dependency inventory, gap analysis and architecture decision record.
+
+### M1 — Stabilize existing VoiceForge
+Fix production build, TypeScript errors, API validation, existing defects and baseline tests.
+
+### M2 — OmniVoice inference foundation
+Integrate a real pinned OmniVoice model and demonstrate actual neural speech generation.
+
+### M3 — Production TTS Studio
+Connect frontend, API, queue, inference worker and persistent output storage.
+
+### M4 — Secure Voice Cloning
+Implement actual audio capture, processing, consent and reusable clone prompts.
+
+### M5 — Voice Design and multilingual evaluation
+Implement documented controls and benchmark supported languages.
+
+### M6 — Visual Studio
+Build original audio-reactive animation and motion-graphics components using the video repository as inspiration.
+
+### M7 — Real video export
+Integrate narration, captions, timeline and playable rendered video.
+
+### M8 — Security, performance and reliability
+Complete adversarial tests, load testing, observability and recovery procedures.
+
+### M9 — Deployment readiness
+Verify CI, clean installation, reproducible builds, deployment configuration and end-to-end release gates.
+
+Each milestone must have:
+
+- Scope.
+- Exact files changed.
+- Tests executed.
+- Test results.
+- Screenshots or output artifacts where relevant.
+- Known limitations.
+- Security implications.
+- Next-step recommendation.
+
+Do not advance a failed gate by merely changing its status to PASS.
+
+---
+
+## 15. Mandatory release gates
+
+VoiceForge may be called production-ready only when:
+
+1. Clean checkout installation succeeds.
+2. Frontend production build succeeds.
+3. Backend production build and startup succeed.
+4. API tests pass.
+5. Frontend tests pass.
+6. Inference tests pass on the supported hardware.
+7. Genuine OmniVoice-generated speech is verified.
+8. Voice cloning requires actual authorized reference audio.
+9. Simulated consent and quality results are removed.
+10. Authentication and resource ownership are enforced.
+11. Media and reusable voice prompts are stored securely.
+12. Audio outputs have correct format, sample rate and duration.
+13. Video exports produce playable media.
+14. Third-party licensing and attribution are documented.
+15. CI, deployment and rollback procedures are verified.
+
+If GPU hardware, credentials, model weights or paid infrastructure are unavailable, mark the corresponding gate BLOCKED. Never fabricate successful execution.
+
+---
+
+## 16. Final reporting contract
+
+At the end of every milestone, report:
+
+**Repository identity:** branch, HEAD, worktree status.
+
+**Implementation:** completed features and exact files.
+
+**Evidence:** commands executed and actual results.
+
+**Quality:** tests passed, failed, skipped and blocked.
+
+**Risks:** security, licensing, deployment and performance.
+
+**Next action:** the smallest independently verifiable next milestone.
+
+Do not commit, push, merge or deploy without explicit authorization.
+
+Start now with **Section 0**, then execute **M0**. In this first session, actually establish the workspace, clone all three repositories if permitted, verify commit identities, inspect the source and license terms, and run safe baseline checks. Produce the integration architecture, licensing matrix, gap report, resource/cost constraints, and milestone execution plan before changing application code. Do not stop at a generic proposal when the terminal and repository operations are available; do not fabricate completion when they are not.
+
+At the end of the first response, state exactly which bootstrap actions ran, which repositories were cloned, their verified SHAs, which baseline checks ran, and the next smallest safe action. No commit, push, merge, deployment, paid resource activation, or production-data modification is authorized by this prompt alone.

@@ -30,6 +30,8 @@ export interface VoiceProfile {
   speakerEmbedding?: number[]; // 192-dim vector from ECAPA-TDNN
   defaultSettings: VoiceSettings;
   avatarUrl?: string;
+  instruct?: string;       // Voice design prompt (e.g. 'female, low pitch, british accent')
+  voicePromptId?: string;  // OmniVoice serialized voice clone prompt ID
 }
 
 export interface AudioQualityReport {
@@ -62,6 +64,8 @@ export interface SynthesisRequest {
   settings?: Partial<VoiceSettings>;
   format?: 'wav' | 'mp3';
   sampleRate?: 22050 | 24000 | 44100;
+  instruct?: string;
+  voicePromptId?: string;
 }
 
 export interface SynthesisResponse {

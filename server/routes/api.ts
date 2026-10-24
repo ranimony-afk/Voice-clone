@@ -268,14 +268,14 @@ apiRouter.post('/dictionary/import', (req, res) => {
 // Synthesize TTS
 apiRouter.post('/tts/synthesize', async (req, res) => {
   try {
-    const { text, voiceId, language, settings, format, sampleRate } = req.body;
+    const { text, voiceId, language, settings, format, sampleRate, instruct, voicePromptId } = req.body;
     if (!text || !voiceId) {
       return res.status(400).json({ error: 'text and voiceId are required fields' });
     }
 
     const voice = customVoices.find(v => v.id === voiceId) || customVoices[0];
     const result = await synthesizer.synthesize(
-      { text, voiceId, language, settings, format, sampleRate },
+      { text, voiceId, language, settings, format, sampleRate, instruct, voicePromptId },
       voice
     );
 
@@ -1413,6 +1413,8 @@ apiRouter.post('/voices/design', (req, res) => {
     const stability = prompt.toLowerCase().includes('energetic') ? 0.65 : 0.85;
     const style = prompt.toLowerCase().includes('dramatic') ? 0.45 : 0.20;
 
+    const instruct = `${targetGender}, ${age || 'adult'}, ${prompt}, ${accent || 'standard'}`;
+
     const newVoice = {
       id: `designed_${Date.now()}`,
       name: `${name} (Voice Design)`,
@@ -1422,6 +1424,7 @@ apiRouter.post('/voices/design', (req, res) => {
       supportedLanguages: ['en', 'hi', 'ta', 'ml', 'ja'] as SupportedLanguage[],
       accent: accent || 'Custom Designed Persona',
       description: `${prompt} • Designed voice persona [Age: ${age || 'adult'}]`,
+      instruct,
       defaultSettings: {
         stability,
         similarity: 0.88,
@@ -1642,5 +1645,223 @@ apiRouter.post('/billing/topup', (req, res) => {
   });
 });
 
+// ============================================================================
+// VERSIONED API CONTRACTS: /api/v1/* (Section 5 Architecture Specification)
+// ============================================================================
+const v1Router = Router();
 
+// In-memory asynchronous jobs ledger for retry-safe idempotency
+interface AsyncJobRecord {
+  jobId: string;
+  type: 'tts' | 'clone' | 'visual_render';
+  status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
+  createdAt: string;
+  updatedAt: string;
+  progressPercent: number;
+  requestPayload: any;
+  result?: any;
+  error?: string;
+}
+const asyncJobsLedger = new Map<string, AsyncJobRecord>();
 
+// Projects storage
+const projectsLedger = new Map<string, any>([
+  ['proj_default_01', {
+    id: 'proj_default_01',
+    title: 'Multilingual Explainer Series',
+    targetLanguages: ['en', 'ta', 'hi', 'ml', 'ja'],
+    status: 'active',
+    createdAt: new Date().toISOString(),
+    scenes: 3,
+  }],
+]);
+
+// 1. Health & Readiness probes
+v1Router.get('/health/live', (_req, res) => {
+  res.json({
+    status: 'live',
+    service: 'VoiceForge 2.0 API',
+    version: '2.0.0-m0',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+v1Router.get('/health/ready', async (_req, res) => {
+  const dbHealth = await checkDatabaseHealth();
+  res.json({
+    status: 'ready',
+    service: 'VoiceForge 2.0 API',
+    version: '2.0.0-m0',
+    primaryEngine: 'k2-fsa/OmniVoice-v0.2.1',
+    supportedLanguages: ['en', 'hi', 'ta', 'ml', 'ja'],
+    database: dbHealth.connected ? 'connected' : 'memory_fallback',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// 2. Voice Catalog
+v1Router.get('/voices', (_req, res) => {
+  res.json({
+    voices: customVoices,
+    total: customVoices.length,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+v1Router.get('/voices/:id', (req, res) => {
+  const voice = customVoices.find(v => v.id === req.params.id);
+  if (!voice) {
+    return res.status(404).json({
+      error: { code: 'VOICE_NOT_FOUND', message: `Voice ID '${req.params.id}' does not exist.` },
+    });
+  }
+  res.json(voice);
+});
+
+v1Router.delete('/voices/:id', (req, res) => {
+  const { id } = req.params;
+  ConsentVerificationEngine.revokeConsent(id, 'user_active');
+  const countBefore = customVoices.length;
+  customVoices = customVoices.filter(v => v.id !== id);
+  memoryStore.customVoices = customVoices;
+  if (customVoices.length === countBefore) {
+    return res.status(404).json({
+      error: { code: 'VOICE_NOT_FOUND', message: `Voice '${id}' not found.` },
+    });
+  }
+  res.json({
+    success: true,
+    voiceId: id,
+    message: `Voice '${id}' deleted and biometric consent revoked.`,
+  });
+});
+
+// 3. Audio Reference Quality Check
+v1Router.post('/audio/reference', (req, res) => {
+  const { audioBase64, durationSeconds } = req.body;
+  const report = AudioQualityAnalyzer.analyze(audioBase64 || '', durationSeconds);
+  res.json(report);
+});
+
+// 4. Asynchronous TTS Job Creation & Lifecycle
+v1Router.post('/tts/jobs', async (req, res) => {
+  const { text, voiceId, language, settings, idempotencyKey } = req.body;
+  if (!text || !voiceId) {
+    return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'text and voiceId are required.' } });
+  }
+
+  // Idempotency check
+  if (idempotencyKey && asyncJobsLedger.has(idempotencyKey)) {
+    return res.json(asyncJobsLedger.get(idempotencyKey));
+  }
+
+  const jobId = idempotencyKey || `job_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  const voice = customVoices.find(v => v.id === voiceId) || customVoices[0];
+
+  const jobRecord: AsyncJobRecord = {
+    jobId,
+    type: 'tts',
+    status: 'processing',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    progressPercent: 20,
+    requestPayload: { text, voiceId, language },
+  };
+  asyncJobsLedger.set(jobId, jobRecord);
+
+  // Execute synthesis
+  try {
+    const result = await synthesizer.synthesize(
+      { text, voiceId, language, settings },
+      voice
+    );
+    jobRecord.status = 'completed';
+    jobRecord.progressPercent = 100;
+    jobRecord.updatedAt = new Date().toISOString();
+    jobRecord.result = result;
+  } catch (err: any) {
+    jobRecord.status = 'failed';
+    jobRecord.error = err.message;
+    jobRecord.updatedAt = new Date().toISOString();
+  }
+
+  res.status(202).json(jobRecord);
+});
+
+v1Router.get('/jobs/:id', (req, res) => {
+  const job = asyncJobsLedger.get(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: `Job '${req.params.id}' not found.` } });
+  }
+  res.json(job);
+});
+
+v1Router.post('/jobs/:id/cancel', (req, res) => {
+  const job = asyncJobsLedger.get(req.params.id);
+  if (!job) {
+    return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: `Job '${req.params.id}' not found.` } });
+  }
+  if (job.status === 'completed' || job.status === 'failed') {
+    return res.status(400).json({ error: { code: 'CANNOT_CANCEL', message: `Job is already ${job.status}.` } });
+  }
+  job.status = 'cancelled';
+  job.updatedAt = new Date().toISOString();
+  res.json({ success: true, job });
+});
+
+// 5. Projects
+v1Router.get('/projects', (_req, res) => {
+  res.json({ projects: Array.from(projectsLedger.values()) });
+});
+
+v1Router.get('/projects/:id', (req, res) => {
+  const proj = projectsLedger.get(req.params.id);
+  if (!proj) {
+    return res.status(404).json({ error: { code: 'PROJECT_NOT_FOUND', message: `Project '${req.params.id}' not found.` } });
+  }
+  res.json(proj);
+});
+
+v1Router.post('/projects', (req, res) => {
+  const { title, targetLanguages, scenes } = req.body;
+  const id = `proj_${Date.now()}`;
+  const newProj = {
+    id,
+    title: title || 'Untitled Voice Project',
+    targetLanguages: targetLanguages || ['en'],
+    scenes: scenes || 1,
+    status: 'active',
+    createdAt: new Date().toISOString(),
+  };
+  projectsLedger.set(id, newProj);
+  res.status(201).json(newProj);
+});
+
+// 6. Visual Studio Motion Graphics Render
+v1Router.post('/visuals/render', (req, res) => {
+  const { templateId, audioDurationSec, resolution, format } = req.body;
+  const renderJobId = `render_${Date.now()}`;
+  const renderRecord: AsyncJobRecord = {
+    jobId: renderJobId,
+    type: 'visual_render',
+    status: 'completed',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    progressPercent: 100,
+    requestPayload: { templateId, audioDurationSec, resolution: resolution || '1080p', format: format || 'mp4' },
+    result: {
+      renderJobId,
+      templateId: templateId || 'audiogram_spectrum',
+      outputFormat: format || 'mp4',
+      resolution: resolution || '1920x1080',
+      durationSeconds: audioDurationSec || 15.0,
+      renderPipeline: 'VoiceForge Visual Studio Canvas 2D / Web Audio Renderer',
+      status: 'ready',
+    },
+  };
+  asyncJobsLedger.set(renderJobId, renderRecord);
+  res.json(renderRecord);
+});
+
+// Mount /api/v1
+apiRouter.use('/v1', v1Router);

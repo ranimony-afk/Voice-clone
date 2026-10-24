@@ -6,3 +6,33 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Upstream & Workspace clones
+third_party/
+voiceforge-work/
+.aistudio/
+
+# Python virtualenvs & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Model weights & binary checkpoints
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.onnx
+
+# Media & audio temporary files
+*.wav
+*.mp3
+*.mp4
+*.webm
+*.m4a

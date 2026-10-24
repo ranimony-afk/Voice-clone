@@ -106,4 +106,89 @@ describe('Express API Integration Tests', () => {
     const data = await res.json();
     assert.equal(data.isValid, false);
   });
+
+  test('GET /api/v1/health/live and ready return active service status', async () => {
+    const liveRes = await fetch(`${baseUrl}/api/v1/health/live`);
+    assert.equal(liveRes.status, 200);
+    const liveData = await liveRes.json();
+    assert.equal(liveData.status, 'live');
+
+    const readyRes = await fetch(`${baseUrl}/api/v1/health/ready`);
+    assert.equal(readyRes.status, 200);
+    const readyData = await readyRes.json();
+    assert.equal(readyData.status, 'ready');
+    assert.equal(readyData.primaryEngine, 'k2-fsa/OmniVoice-v0.2.1');
+  });
+
+  test('GET /api/v1/voices returns voice catalogue', async () => {
+    const res = await fetch(`${baseUrl}/api/v1/voices`);
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.ok(Array.isArray(data.voices));
+    assert.ok(data.voices.length >= 5);
+  });
+
+  test('POST /api/v1/tts/jobs queues and completes synthesis job', async () => {
+    const res = await fetch(`${baseUrl}/api/v1/tts/jobs`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: 'Automated test of v1 asynchronous job runner.',
+        voiceId: 'vf_sarah_en',
+        language: 'en',
+      }),
+    });
+    assert.equal(res.status, 202);
+    const job = await res.json();
+    assert.ok(job.jobId);
+    assert.equal(job.status, 'completed');
+    assert.ok(job.result);
+    assert.ok(job.result.audioBase64);
+
+    // Verify polling endpoint
+    const pollRes = await fetch(`${baseUrl}/api/v1/jobs/${job.jobId}`);
+    assert.equal(pollRes.status, 200);
+    const polledJob = await pollRes.json();
+    assert.equal(polledJob.jobId, job.jobId);
+  });
+
+  test('POST /api/v1/projects creates a multi-scene project', async () => {
+    const res = await fetch(`${baseUrl}/api/v1/projects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'Documentary Audio Project',
+        targetLanguages: ['en', 'ta'],
+        scenes: 3,
+      }),
+    });
+    assert.equal(res.status, 201);
+    const proj = await res.json();
+    assert.ok(proj.id);
+    assert.equal(proj.title, 'Documentary Audio Project');
+
+    const listRes = await fetch(`${baseUrl}/api/v1/projects`);
+    assert.equal(listRes.status, 200);
+    const listData = await listRes.json();
+    assert.ok(listData.projects.some((p: any) => p.id === proj.id));
+  });
+
+  test('POST /api/v1/visuals/render executes motion graphics render job', async () => {
+    const res = await fetch(`${baseUrl}/api/v1/visuals/render`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        templateId: 'kinetic_typography',
+        audioDurationSec: 8.5,
+        resolution: '1080p',
+        format: 'mp4',
+      }),
+    });
+    assert.equal(res.status, 200);
+    const renderRecord = await res.json();
+    assert.ok(renderRecord.jobId);
+    assert.equal(renderRecord.status, 'completed');
+    assert.equal(renderRecord.result.templateId, 'kinetic_typography');
+    assert.ok(renderRecord.result.renderPipeline);
+  });
 });

@@ -39,6 +39,75 @@ export interface PluggableSpeechEngine {
 }
 
 /**
+ * OmniVoice Neural Speech Engine (k2-fsa/OmniVoice 2.0)
+ * Connects to the local/containerized Python OmniVoice inference service.
+ * Supports:
+ * - 600+ language zero-shot TTS
+ * - Voice cloning with prompt reuse
+ * - Voice design (gender, age, pitch, accent, whisper)
+ * - Non-verbal tags like [laughter]
+ */
+export class OmniVoiceSpeechEngine implements PluggableSpeechEngine {
+  public readonly id = 'omnivoice_neural';
+  public readonly name = 'OmniVoice 2.0 (k2-fsa/OmniVoice)';
+  public readonly isNeural = true;
+  private serviceUrl: string;
+
+  constructor() {
+    this.serviceUrl = process.env.OMNIVOICE_SERVICE_URL || 'http://localhost:8001';
+  }
+
+  public async isAvailable(): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.serviceUrl}/health/live`, { signal: AbortSignal.timeout(800) });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  public async synthesize(params: {
+    text: string;
+    ipa: string;
+    language: SupportedLanguage;
+    voice: VoiceProfile;
+    sampleRate: number;
+  }): Promise<{ audioBuffer: Buffer; sampleRate: number; engineUsed: string }> {
+    const payload: Record<string, any> = {
+      text: params.text,
+      language: params.language,
+      speed: params.voice.defaultSettings.speed || 1.0,
+      normalize_text: true,
+    };
+
+    if (params.voice.instruct) {
+      payload.instruct = params.voice.instruct;
+    }
+    if (params.voice.voicePromptId) {
+      payload.voice_prompt_id = params.voice.voicePromptId;
+    }
+
+    const res = await fetch(`${this.serviceUrl}/tts/synthesize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`OmniVoice inference service returned error: ${err}`);
+    }
+
+    const data = await res.json();
+    return {
+      audioBuffer: Buffer.from(data.audio_base64, 'base64'),
+      sampleRate: data.sample_rate || 24000,
+      engineUsed: `k2-fsa/OmniVoice-v0.2.1 (${data.mode || 'neural'})`,
+    };
+  }
+}
+
+/**
  * Gemini Neural Speech Engine
  * Invokes Gemini API speech capabilities when available
  */
@@ -211,6 +280,7 @@ class DevFormantSynthesizer implements PluggableSpeechEngine {
 
 export class VoiceForgeSynthesizer {
   private engines: PluggableSpeechEngine[] = [
+    new OmniVoiceSpeechEngine(),
     new GeminiNeuralSpeechEngine(),
     new DevFormantSynthesizer(),
   ];
