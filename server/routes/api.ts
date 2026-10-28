@@ -3,7 +3,10 @@
  */
 
 import { Router } from 'express';
+import crypto from 'node:crypto';
+import { eq } from 'drizzle-orm';
 import { DEFAULT_VOICES } from '../data/voices.ts';
+import { isRestrictedEnvironment, resolveRuntimeEnvironment } from '../config/env.ts';
 import { VoiceForgeSynthesizer } from '../engine/audio/synthesizer.ts';
 import { TextNormalizer } from '../engine/frontend/normalizer.ts';
 import { Phonemizer } from '../engine/frontend/phonemizer.ts';
@@ -17,7 +20,13 @@ import { getDatabase, memoryStore, checkDatabaseHealth } from '../db/index.ts';
 import { videoTransformJobs, transcriptionTranslationJobs, voices as voicesTable, dictionaries as dictionariesTable, consentRecords as consentRecordsTable, privateMedia as privateMediaTable, synthesisJobs as synthesisJobsTable, auditEvents as auditEventsTable } from '../db/schema.ts';
 import { runMigrations } from '../db/migrate.ts';
 import { AuthService, requireAuth, optionalAuth, requireRole, requireOwner, PRELOADED_USERS, AuthenticatedUser } from '../auth/auth.ts';
-import { PrivateStorageService, PrivateMediaRecord } from '../storage/privateStorage.ts';
+import {
+  PrivateStorageService,
+  PrivateMediaRecord,
+  MediaInvalidationReason,
+  MediaInvalidationOutcome,
+  InvalidatedVoiceEntry,
+} from '../storage/privateStorage.ts';
 import {
   authRateLimiter,
   mediaUploadRateLimiter,
@@ -74,39 +83,452 @@ export function logAuditEvent(params: {
   return event;
 }
 
-// ============================================================================
-// AUTHENTICATION & IDENTITY ENDPOINTS (Phase 3A)
-// ============================================================================
+function isPublicVoice(voice: any): boolean {
+  return Boolean(voice && (voice.category === 'premade' || voice.isPublic === true));
+}
 
-// Issue signed session token for a predefined or custom user identity
-apiRouter.post('/v1/auth/token', (req, res) => {
-  const { email, userId, role, name } = req.body;
-  let user: AuthenticatedUser | undefined;
+function isBuiltInPremadeVoice(voiceId?: string): boolean {
+  return Boolean(voiceId && DEFAULT_VOICES.some((v) => v.id === voiceId));
+}
 
-  if (userId && PRELOADED_USERS[userId]) {
-    user = PRELOADED_USERS[userId];
-  } else if (email) {
-    user = AuthService.getUserByEmail(email);
+/**
+ * Synchronizes process-local voice catalog and biometric consent state from the shared durable
+ * invalidation ledger so sibling workers sharing storage immediately enforce voice revocations
+ * and deletions without requiring a process restart.
+ */
+function syncDurableVoiceState(voiceId?: string): InvalidatedVoiceEntry | undefined {
+  if (!voiceId) return undefined;
+  const durableVoiceInv = PrivateStorageService.getVoiceInvalidationRecord(voiceId);
+  if (!durableVoiceInv) return undefined;
+
+  if (customVoices.some((v) => v.id === voiceId)) {
+    customVoices = customVoices.filter((v) => v.id !== voiceId);
+    memoryStore.customVoices = customVoices;
   }
 
+  if (durableVoiceInv.reason === 'consent_revoked') {
+    try {
+      ConsentVerificationEngine.revokeConsent(voiceId, durableVoiceInv.ownerId || 'system', {
+        isAdmin: true,
+        recordRevocationMarker: true,
+        resourceOwnerId: durableVoiceInv.ownerId,
+      });
+    } catch {
+      // Fail-closed checks downstream also inspect durableVoiceInv directly
+    }
+    const cr = memoryStore.consentRecords.find((r: any) => r.voiceId === voiceId);
+    if (cr) {
+      cr.status = 'revoked';
+      cr.revokedAt = cr.revokedAt || durableVoiceInv.invalidatedAt;
+    }
+  }
+
+  return durableVoiceInv;
+}
+
+/**
+ * Returns `true` if a voice profile has been positively consent-revoked either in the shared
+ * durable invalidation ledger or in the local `ConsentVerificationEngine`.
+ * Evaluated BEFORE ledger health assertions so known-revoked voices deterministically return
+ * `403 CONSENT_REVOKED` even while storage is read-only/degraded.
+ */
+function isPositivelyConsentRevoked(voiceId?: string): boolean {
+  if (!voiceId) return false;
+  const durableVoiceInv = syncDurableVoiceState(voiceId);
+  if (durableVoiceInv && durableVoiceInv.reason === 'consent_revoked') {
+    return true;
+  }
+  try {
+    const rec = ConsentVerificationEngine.getAuditRecord(voiceId);
+    if (rec && (rec.status === 'revoked' || !ConsentVerificationEngine.isConsentActive(voiceId))) {
+      return true;
+    }
+    if (!ConsentVerificationEngine.isConsentActive(voiceId)) {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Enforces that non-premade custom/cloned voice operations fail closed (`503 STORAGE_UNAVAILABLE`)
+ * whenever the shared durable invalidation ledger cannot be read or validated, preventing a stale
+ * sibling worker from treating unreadable revocation state as active consent.
+ */
+function assertNonPremadeVoiceLedgerHealthy(voiceId?: string): void {
+  if (!voiceId || isBuiltInPremadeVoice(voiceId)) return;
+  PrivateStorageService.assertInvalidationLedgerHealthy();
+}
+
+function filterVisibleVoices(voicesList: any[], user?: AuthenticatedUser): any[] {
+  const ledgerHealthy = PrivateStorageService.isInvalidationLedgerHealthy();
+  return voicesList.filter((v) => {
+    if (!v || typeof v.id !== 'string') return false;
+    if (syncDurableVoiceState(v.id)) return false;
+    if (!isBuiltInPremadeVoice(v.id) && !ledgerHealthy) return false;
+    if (!ConsentVerificationEngine.isConsentActive(v.id)) return false;
+    if (isPublicVoice(v)) return true;
+    if (user?.role === 'admin') return true;
+    return Boolean(user && v.userId && v.userId === user.id);
+  });
+}
+
+function checkVoiceAccess(
+  voice: any,
+  user?: AuthenticatedUser
+): { allowed: true } | { allowed: false; status: 401 | 403; code: string; error: string } {
+  if (isPublicVoice(voice)) {
+    return { allowed: true };
+  }
   if (!user) {
-    const assignedId = userId || `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    user = {
-      id: assignedId,
-      email: email || `${assignedId}@voiceforge.local`,
-      fullName: name || 'VoiceForge User',
-      role: (role === 'admin' || role === 'creator' ? role : 'user'),
-      creditBalance: 10000,
+    return {
+      allowed: false,
+      status: 401,
+      code: 'AUTH_REQUIRED',
+      error: 'Authentication required to access private voice profile.',
     };
-    AuthService.registerUser(user);
+  }
+  if (user.role === 'admin' || (Boolean(voice.userId) && voice.userId === user.id)) {
+    return { allowed: true };
+  }
+  return {
+    allowed: false,
+    status: 403,
+    code: 'FORBIDDEN_NOT_OWNER',
+    error: `Forbidden: You do not own cloned or custom voice "${voice.name || voice.id}"`,
+  };
+}
+
+/**
+ * Fail-closed active biometric consent check for synthesis jobs and media artifacts.
+ * Consults both the shared durable voice invalidation ledger and `ConsentVerificationEngine`.
+ * Returns `false` if consent was revoked or voice was deleted, if cryptographic consent
+ * verification fails/throws, or if a non-premade custom voice was removed without an active
+ * verified consent record.
+ */
+function isVoiceConsentVerifiedActive(voiceId?: string): boolean {
+  if (!voiceId) return true;
+  if (syncDurableVoiceState(voiceId)) {
+    return false;
+  }
+  try {
+    if (!ConsentVerificationEngine.isConsentActive(voiceId)) {
+      return false;
+    }
+  } catch {
+    return false;
   }
 
-  const token = AuthService.issueToken(user);
+  if (!isBuiltInPremadeVoice(voiceId)) {
+    const inActiveCatalog = customVoices.some((v) => v.id === voiceId);
+    const auditRecord = ConsentVerificationEngine.getAuditRecord(voiceId);
+    if (!inActiveCatalog && (!auditRecord || auditRecord.status !== 'active')) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Synchronously scrubs all synthesized audio fields and retrieval pointers from an in-memory job record,
+ * returning any previous `outputMediaId` so the underlying private storage artifact can be invalidated.
+ */
+function scrubJobAudioArtifactsInMemory(job: any, errorMessage?: string): string | undefined {
+  if (!job || typeof job !== 'object') return undefined;
+  const mediaId = typeof job.outputMediaId === 'string' ? job.outputMediaId : undefined;
+  job.status = 'cancelled';
+  job.updatedAt = new Date().toISOString();
+  if (errorMessage) {
+    job.error = errorMessage;
+  }
+  delete job.result;
+  delete job.outputSignedUrl;
+  delete job.outputMediaId;
+  return mediaId;
+}
+
+/**
+ * Produces a safe serialized copy of a synthesis job that omits audio data, signed URLs, and media IDs
+ * whenever the job is cancelled or lacks an active result.
+ */
+function serializeSafeSynthesisJob(job: any): Record<string, any> {
+  const clone: Record<string, any> = { ...job };
+  if (clone.status === 'cancelled' || !clone.result) {
+    delete clone.result;
+    delete clone.outputSignedUrl;
+    delete clone.outputMediaId;
+  }
+  return clone;
+}
+
+const UUID_FORMAT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isPubliclyAccessibleVoiceId(voiceId?: string): boolean {
+  if (!voiceId) return true;
+  if (DEFAULT_VOICES.some((v) => v.id === voiceId)) {
+    return isVoiceConsentVerifiedActive(voiceId);
+  }
+  const catalogVoice = customVoices.find((v) => v.id === voiceId);
+  if (!catalogVoice || !isPublicVoice(catalogVoice)) {
+    return false;
+  }
+  return isVoiceConsentVerifiedActive(voiceId);
+}
+
+function isPrivateTranscriptionJob(job: any): boolean {
+  if (!job || typeof job !== 'object') return true;
+  if (job.isPrivate === true) return true;
+  if (typeof job.userId === 'string' && job.userId.trim().length > 0) return true;
+  if (typeof job.dubbingVoiceId === 'string' && job.dubbingVoiceId.trim().length > 0) {
+    if (!isPubliclyAccessibleVoiceId(job.dubbingVoiceId.trim())) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Synchronously scrubs all dubbed WAV payloads, inline data URLs, base64 audio, and signed retrieval pointers
+ * from a transcription/translation dubbing job record, returning any linked `outputMediaId`.
+ */
+function scrubTranscriptionJobArtifactsInMemory(job: any, errorMessage?: string): string | undefined {
+  if (!job || typeof job !== 'object') return undefined;
+  const mediaId = typeof job.outputMediaId === 'string' ? job.outputMediaId : undefined;
+  job.status = 'cancelled';
+  job.updatedAt = new Date().toISOString();
+  if (errorMessage) {
+    job.error = errorMessage;
+  }
+  delete job.dubbedAudioUrl;
+  delete job.audioBase64;
+  delete job.outputSignedUrl;
+  delete job.outputMediaId;
+  delete job.dubbedDuration;
+  return mediaId;
+}
+
+function serializeSafeTranscriptionJob(job: any): Record<string, any> {
+  const clone: Record<string, any> = { ...job };
+  if (
+    clone.status === 'cancelled' ||
+    (typeof clone.dubbingVoiceId === 'string' &&
+      clone.dubbingVoiceId.trim().length > 0 &&
+      !isVoiceConsentVerifiedActive(clone.dubbingVoiceId.trim())) ||
+    (typeof clone.outputMediaId === 'string' && PrivateStorageService.isMediaInvalidated(clone.outputMediaId))
+  ) {
+    clone.status = 'cancelled';
+    delete clone.dubbedAudioUrl;
+    delete clone.audioBase64;
+    delete clone.outputSignedUrl;
+    delete clone.outputMediaId;
+    delete clone.dubbedDuration;
+  } else {
+    // Never expose internal storage media IDs or signed URLs directly in transcription job listings unless explicitly requested via media routes
+    delete clone.outputMediaId;
+    delete clone.outputSignedUrl;
+  }
+  return clone;
+}
+
+async function scrubTranscriptionJobsInDatabaseByVoiceId(voiceId: string): Promise<void> {
+  if (!voiceId) return;
+  try {
+    const { db, isConnected } = getDatabase();
+    if (db && isConnected) {
+      await db
+        .update(transcriptionTranslationJobs)
+        .set({
+          dubbedAudioUrl: null,
+          status: 'cancelled',
+          updatedAt: new Date(),
+        })
+        .where(eq(transcriptionTranslationJobs.dubbingVoiceId, voiceId));
+    }
+  } catch {
+    // In-memory store and PrivateStorageService tombstones already updated synchronously
+  }
+}
+
+/**
+ * Records sanitized audit events if underlying storage provider deletion fails after pre-delete invalidation.
+ * Never logs or exposes audio payloads, filesystem paths, or storage secrets/credentials.
+ */
+function recordSanitizedCleanupFailures(
+  actorUserId: string,
+  parentResourceId: string,
+  outcomes: MediaInvalidationOutcome[],
+  context: { voiceId?: string; reason: MediaInvalidationReason }
+): number {
+  let failures = 0;
+  for (const outcome of outcomes) {
+    if (outcome.cleanupFailed) {
+      failures++;
+      logAuditEvent({
+        userId: actorUserId,
+        eventType: 'media_artifact_cleanup_failed',
+        resourceId: outcome.mediaId || parentResourceId,
+        status: 'failure',
+        details: {
+          parentResourceId,
+          voiceId: context.voiceId || null,
+          reason: context.reason,
+          failureCode: outcome.cleanupFailureCode || 'CLEANUP_ERROR',
+          artifactRemainsInvalidated: true,
+        },
+      });
+    }
+  }
+  return failures;
+}
+
+// Tracks resources whose in-memory scrub/revocation succeeded while durable invalidation ledger
+// persistence failed, keeping repeat cancel/delete calls idempotently retriable once storage recovers.
+const pendingCancelledJobMedia = new Map<string, string>();
+const pendingDeletedVoices = new Map<string, any>();
+
+/**
+ * Eagerly scrubs all jobs for `voiceId` across both job stores and invalidates/deletes all matching
+ * private storage artifacts (`reference_audio`, `consent_audio`, `tts_output`, and job `outputMediaId`s).
+ * Must only be called after caller ownership of `voiceId` (or `admin` role) has been verified.
+ */
+async function purgeVoiceArtifactsAndJobs(params: {
+  voiceId: string;
+  actorUserId: string;
+  isAdmin: boolean;
+  reason: 'consent_revoked' | 'voice_deleted';
+  errorMessage: string;
+}): Promise<{
+  scrubbedJobsCount: number;
+  invalidatedMediaCount: number;
+  cleanupFailuresCount: number;
+  durableInvalidationFailedCount: number;
+}> {
+  const { voiceId, actorUserId, isAdmin, reason, errorMessage } = params;
+  const discoveredMedia = new Map<string, string | undefined>();
+  const scrubbedJobIds = new Set<string>();
+
+  for (const job of memoryStore.synthesisJobs as any[]) {
+    if (job && job.voiceId === voiceId) {
+      const mediaId = scrubJobAudioArtifactsInMemory(job, errorMessage);
+      if (mediaId) discoveredMedia.set(mediaId, job.userId);
+      if (job.id) scrubbedJobIds.add(job.id);
+    }
+  }
+
+  for (const [jobId, ledgerJob] of asyncJobsLedger.entries()) {
+    if (ledgerJob && ledgerJob.voiceId === voiceId) {
+      const mediaId = scrubJobAudioArtifactsInMemory(ledgerJob, errorMessage);
+      if (mediaId && !discoveredMedia.has(mediaId)) {
+        discoveredMedia.set(mediaId, ledgerJob.userId);
+      }
+      scrubbedJobIds.add(jobId);
+    }
+  }
+
+  for (const tJob of memoryStore.transcriptionJobs as any[]) {
+    if (tJob && (tJob.dubbingVoiceId === voiceId || tJob.voiceId === voiceId)) {
+      const tMediaId = scrubTranscriptionJobArtifactsInMemory(tJob, errorMessage);
+      if (tMediaId && !discoveredMedia.has(tMediaId)) {
+        discoveredMedia.set(tMediaId, tJob.userId || actorUserId);
+      }
+      if (tJob.id) {
+        scrubbedJobIds.add(tJob.id);
+      }
+    }
+  }
+
+  await scrubTranscriptionJobsInDatabaseByVoiceId(voiceId);
+
+  const additionalArtifacts = Array.from(discoveredMedia.entries()).map(
+    ([mediaId, fallbackOwnerId]) => ({
+      mediaId,
+      fallbackOwnerId,
+    })
+  );
+
+  const outcomes = await PrivateStorageService.invalidateByVoiceId({
+    voiceId,
+    requestingUserId: actorUserId,
+    isAdmin,
+    reason,
+    additionalArtifacts,
+  });
+
+  const cleanupFailuresCount = recordSanitizedCleanupFailures(actorUserId, voiceId, outcomes, {
+    voiceId,
+    reason,
+  });
+  const durableInvalidationFailedCount =
+    outcomes.filter((o) => !o.durableInvalidationEstablished).length +
+    (!PrivateStorageService.isInvalidationLedgerHealthy() ? 1 : 0);
+
+  return {
+    scrubbedJobsCount: scrubbedJobIds.size,
+    invalidatedMediaCount: outcomes.filter((o) => o.invalidated).length,
+    cleanupFailuresCount,
+    durableInvalidationFailedCount,
+  };
+}
+
+// ============================================================================
+// AUTHENTICATION & IDENTITY ENDPOINTS (Phase 3A / Phase 3C-S1 Hardened)
+// ============================================================================
+
+// Fail-closed token endpoint:
+// - Never accepts caller-supplied userId, email, or role claims.
+// - Never mints tokens for preloaded/existing principals or elevates privileges.
+// - Fails closed in staging, production, test, and default development because no
+//   external/credential authentication provider is configured in this repository.
+// - Optional local sandbox session (role: 'user') is strictly gated behind BOTH
+//   validated NODE_ENV === 'development' AND VOICEFORGE_ENABLE_DEV_DEMO_AUTH === 'true'.
+apiRouter.post('/v1/auth/token', (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const hasIdentityOrRoleClaim =
+    body.role !== undefined || body.userId !== undefined || body.email !== undefined;
+
+  if (hasIdentityOrRoleClaim) {
+    logAuditEvent({
+      userId: 'anonymous',
+      eventType: 'auth_token_issuance_denied',
+      status: 'denied',
+      details: {
+        reason: 'Caller-supplied userId, email, or role claim rejected',
+        env: resolveRuntimeEnvironment(process.env.NODE_ENV),
+      },
+    });
+    return res.status(403).json({
+      error:
+        'Forbidden: caller-supplied userId, email, and role claims are never accepted for token issuance.',
+      code: 'FORBIDDEN_IDENTITY_CLAIM',
+    });
+  }
+
+  if (!AuthService.isDevDemoBootstrapEnabled()) {
+    logAuditEvent({
+      userId: 'anonymous',
+      eventType: 'auth_token_issuance_denied',
+      status: 'denied',
+      details: {
+        reason: 'No server-side authentication provider configured; token issuance disabled',
+        env: resolveRuntimeEnvironment(process.env.NODE_ENV),
+      },
+    });
+    return res.status(401).json({
+      error:
+        'Authentication unavailable: no server-side authentication provider is configured for this environment.',
+      code: 'AUTH_PROVIDER_UNAVAILABLE',
+    });
+  }
+
+  const { token, user } = AuthService.issueDevSandboxToken();
   logAuditEvent({
     userId: user.id,
-    eventType: 'auth_token_issued',
+    eventType: 'auth_dev_sandbox_token_issued',
     status: 'success',
-    details: { email: user.email, role: user.role },
+    details: { email: user.email, role: user.role, mode: 'development_sandbox' },
   });
 
   res.json({
@@ -128,19 +550,43 @@ apiRouter.get('/v1/auth/me', requireAuth, (req, res) => {
   });
 });
 
-// Revoke active token session
-apiRouter.post('/v1/auth/revoke', authRateLimiter, (req, res) => {
-  const authHeader = req.headers.authorization;
-  const tokenFromHeader = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7) : null;
-  const token = req.body?.token || tokenFromHeader;
-
-  if (!token) {
-    return res.status(400).json({ error: 'Token is required for revocation' });
+// Revoke active token session (requires authenticated caller; prevents cross-user revocation & audit spoofing)
+apiRouter.post('/v1/auth/revoke', authRateLimiter, requireAuth, (req, res) => {
+  const callerToken = AuthService.extractToken(req);
+  if (!callerToken) {
+    return res.status(401).json({ error: 'Authentication required', code: 'AUTH_REQUIRED' });
   }
 
-  AuthService.revokeToken(token);
+  const bodyToken =
+    typeof req.body?.token === 'string' && req.body.token.trim().length > 0
+      ? req.body.token.trim()
+      : null;
+  const targetToken = bodyToken || callerToken;
+
+  if (targetToken !== callerToken) {
+    if (req.user!.role !== 'admin') {
+      logAuditEvent({
+        userId: req.user!.id,
+        eventType: 'auth_token_revocation_denied',
+        status: 'denied',
+      });
+      return res.status(403).json({
+        error: 'Forbidden: cannot revoke a session token belonging to another principal.',
+        code: 'FORBIDDEN_TOKEN_REVOCATION',
+      });
+    }
+
+    if (!AuthService.isTokenRevoked(targetToken) && !AuthService.verifyToken(targetToken)) {
+      return res.status(400).json({
+        error: 'Invalid or unrecognized session token for administrative revocation',
+        code: 'INVALID_TOKEN',
+      });
+    }
+  }
+
+  AuthService.revokeToken(targetToken, { userId: req.user!.id, reason: 'Session revocation' });
   logAuditEvent({
-    userId: req.body?.userId || 'session',
+    userId: req.user!.id,
     eventType: 'auth_token_revoked',
     status: 'success',
   });
@@ -258,8 +704,8 @@ apiRouter.get('/db/status', async (_req, res) => {
   }
 });
 
-// Trigger PostgreSQL Database Migrations
-apiRouter.post('/db/migrate', async (_req, res) => {
+// Trigger PostgreSQL Database Migrations (Admin-only privileged operation)
+apiRouter.post('/db/migrate', requireAuth, requireRole('admin'), async (_req, res) => {
   try {
     const result = await runMigrations();
     res.json(result);
@@ -268,9 +714,9 @@ apiRouter.post('/db/migrate', async (_req, res) => {
   }
 });
 
-// Voices List
-apiRouter.get('/voices', (req, res) => {
-  res.json({ voices: customVoices });
+// Voices List (Scoped: public/premade voices + authenticated caller's private voices)
+apiRouter.get('/voices', optionalAuth, (req, res) => {
+  res.json({ voices: filterVisibleVoices(customVoices, req.user) });
 });
 
 // Multilingual Text Analysis & Front-End (Normalizer + G2P + Code-Switching)
@@ -389,11 +835,14 @@ apiRouter.post('/tts/synthesize', optionalAuth, async (req, res) => {
       return res.status(400).json({ error: 'text and voiceId are required fields' });
     }
 
-    // 1. Biometric consent revocation check by voiceId (fail-closed even if unlisted after revocation)
-    const consentRecord = ConsentVerificationEngine.getAuditRecord(voiceId);
-    if (consentRecord && (consentRecord.status === 'revoked' || !ConsentVerificationEngine.isConsentActive(voiceId))) {
+    // 1. Biometric consent revocation check by voiceId (consults shared durable ledger + engine)
+    if (isPositivelyConsentRevoked(voiceId)) {
+      const consentRecord = ConsentVerificationEngine.getAuditRecord(voiceId);
+      const durableVoice = PrivateStorageService.getVoiceInvalidationRecord(voiceId);
       logAuditEvent({
-        userId: req.user ? req.user.id : (consentRecord.userId || 'anonymous'),
+        userId: req.user
+          ? req.user.id
+          : consentRecord?.userId || durableVoice?.ownerId || 'anonymous',
         eventType: 'synthesis_blocked_revoked_consent',
         resourceId: voiceId,
         status: 'denied',
@@ -405,28 +854,30 @@ apiRouter.post('/tts/synthesize', optionalAuth, async (req, res) => {
       });
     }
 
+    syncDurableVoiceState(voiceId);
+
     const voice = customVoices.find(v => v.id === voiceId);
     if (!voice) {
       return res.status(404).json({ error: `Voice '${voiceId}' not found`, code: 'VOICE_NOT_FOUND' });
     }
 
-    // Biometric consent and tenant check on voice profile
-    if (voice.category === 'cloned_instant' || voice.category === 'cloned_professional') {
-      // Check tenant ownership if user is authenticated and voice has an assigned owner
-      if (req.user && voice.userId && voice.userId !== req.user.id && req.user.role !== 'admin' && !voice.isPublic) {
-        logAuditEvent({
-          userId: req.user.id,
-          eventType: 'synthesis_blocked_unauthorized_voice',
-          resourceId: voice.id,
-          status: 'denied',
-          details: { voiceOwnerId: voice.userId },
-        });
-        return res.status(403).json({
-          error: `Forbidden: You do not own cloned voice "${voice.name}"`,
-          code: 'FORBIDDEN_NOT_OWNER',
-        });
-      }
+    // Strict tenant ownership check on all private voices (rejects both anonymous and cross-tenant callers)
+    const access = checkVoiceAccess(voice, req.user);
+    if (!access.allowed) {
+      logAuditEvent({
+        userId: req.user ? req.user.id : 'anonymous',
+        eventType: 'synthesis_blocked_unauthorized_voice',
+        resourceId: voice.id,
+        status: 'denied',
+        details: { voiceOwnerId: voice.userId || null, code: access.code },
+      });
+      return res.status(access.status).json({
+        error: access.error,
+        code: access.code,
+      });
     }
+
+    assertNonPremadeVoiceLedgerHealthy(voice.id);
 
     const result = await synthesizer.synthesize(
       { text, voiceId, language, settings, format, sampleRate, instruct, voicePromptId },
@@ -435,6 +886,12 @@ apiRouter.post('/tts/synthesize', optionalAuth, async (req, res) => {
 
     res.json(result);
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     console.error('Synthesis error:', err);
     if (err.message && err.message.includes('Synthesis prohibited: Biometric consent')) {
       return res.status(403).json({ error: err.message, code: 'CONSENT_REVOKED' });
@@ -467,12 +924,12 @@ function generateSpeakerEmbedding(seedStr: string): number[] {
 // 1. Issue fresh cryptographic consent challenge with 5-minute TTL & replay protection
 apiRouter.post('/voices/clone/challenge', authRateLimiter, optionalAuth, (req, res) => {
   try {
-    const { userId: clientUserId, voiceName, customTtlMs } = req.body;
+    const { voiceName, customTtlMs } = req.body;
     if (!voiceName) {
       return res.status(400).json({ error: 'voiceName is required to issue a consent challenge' });
     }
-    // Authenticated user ID is authoritative over client-supplied body value
-    const effectiveUserId = req.user ? req.user.id : (typeof clientUserId === 'string' && clientUserId.trim().length > 0 ? clientUserId.trim() : 'usr_default_creator');
+    // Server-authenticated principal is strictly authoritative; caller-supplied body userId is never trusted
+    const effectiveUserId = req.user ? req.user.id : 'anonymous';
     const challenge = ConsentVerificationEngine.issueChallenge(effectiveUserId, voiceName, customTtlMs);
 
     logAuditEvent({
@@ -485,7 +942,10 @@ apiRouter.post('/voices/clone/challenge', authRateLimiter, optionalAuth, (req, r
 
     res.json(challenge);
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const safeError = isRestrictedEnvironment(process.env.NODE_ENV)
+      ? 'Consent challenge service configuration error'
+      : err.message;
+    res.status(500).json({ error: safeError, code: 'CONSENT_SERVICE_ERROR' });
   }
 });
 
@@ -504,7 +964,7 @@ apiRouter.post('/voices/clone/analyze', (req, res) => {
   }
 });
 
-// 3. Secure Voice Enrollment & Consent Biometric Verification (Never simulated)
+// 3. Secure Voice Enrollment & Consent Biometric Verification (Never simulated; requires verified auth)
 apiRouter.post('/voices/clone/verify-consent', authRateLimiter, optionalAuth, (req, res) => {
   try {
     const {
@@ -512,7 +972,6 @@ apiRouter.post('/voices/clone/verify-consent', authRateLimiter, optionalAuth, (r
       voiceName,
       referenceAudioBase64,
       consentAudioBase64,
-      userId: clientUserId,
       gender,
       primaryLanguage,
     } = req.body;
@@ -528,17 +987,32 @@ apiRouter.post('/voices/clone/verify-consent', authRateLimiter, optionalAuth, (r
       });
     }
 
-    // Effective identity: Authenticated token is authoritative
-    const effectiveUserId = req.user ? req.user.id : (typeof clientUserId === 'string' && clientUserId.trim().length > 0 ? clientUserId.trim() : (challenge.userId || 'usr_default_creator'));
+    // Require verified server-side authentication before enrolling any voice or mutating consent state
+    if (!req.user) {
+      logAuditEvent({
+        userId: 'anonymous',
+        eventType: 'consent_enrollment_denied_unauthenticated',
+        resourceId: challenge?.challengeId || null,
+        status: 'denied',
+      });
+      return res.status(401).json({
+        verified: false,
+        error: 'Authentication required to enroll a cloned voice profile.',
+        code: 'AUTH_REQUIRED',
+      });
+    }
 
-    // Anti-spoofing guard: Challenge must belong to the active user identity
-    if (challenge.userId && challenge.userId !== effectiveUserId) {
+    // Effective identity: Authenticated server principal only (body userId is ignored)
+    const effectiveUserId = req.user.id;
+
+    // Anti-spoofing guard: Challenge must belong to the active authenticated principal
+    if (!challenge.userId || challenge.userId !== effectiveUserId) {
       logAuditEvent({
         userId: effectiveUserId,
         eventType: 'consent_challenge_spoofing_attempt',
         resourceId: challenge.challengeId,
         status: 'denied',
-        details: { challengeUserId: challenge.userId, attemptUserId: effectiveUserId },
+        details: { challengeUserId: challenge.userId || null, attemptUserId: effectiveUserId },
       });
       return res.status(403).json({
         verified: false,
@@ -636,34 +1110,47 @@ apiRouter.post('/voices/clone/verify-consent', authRateLimiter, optionalAuth, (r
       message: 'Biometric voice verification confirmed. Voice enrolled successfully.',
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const safeError = isRestrictedEnvironment(process.env.NODE_ENV)
+      ? 'Consent verification service configuration error'
+      : err.message;
+    res.status(500).json({ error: safeError, code: 'CONSENT_SERVICE_ERROR' });
   }
 });
 
-// 4. Revoke Biometric Consent for a Voice Profile (Ownership protected)
-apiRouter.post('/voices/clone/revoke-consent', optionalAuth, (req, res) => {
+// 4. Revoke Biometric Consent for a Voice Profile (Strictly authenticated & ownership protected)
+apiRouter.post('/voices/clone/revoke-consent', requireAuth, async (req, res) => {
   try {
-    const { voiceId, userId: clientUserId } = req.body;
-    if (!voiceId) {
+    const { voiceId } = req.body;
+    if (!voiceId || typeof voiceId !== 'string') {
       return res.status(400).json({ error: 'voiceId is required' });
     }
 
-    const effectiveUserId = req.user ? req.user.id : (typeof clientUserId === 'string' && clientUserId.trim().length > 0 ? clientUserId.trim() : 'usr_default_creator');
+    // Server-verified caller identity and role only; request-body userId is completely ignored
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
 
-    // Find voice in customVoices or auditRecords
-    const targetVoice = customVoices.find(v => v.id === voiceId);
+    // Find voice in customVoices, pendingDeletedVoices, auditRecords, or durable invalidation ledger
+    const targetVoice = customVoices.find((v) => v.id === voiceId) || pendingDeletedVoices.get(voiceId);
     const auditRecord = ConsentVerificationEngine.getAuditRecord(voiceId);
+    const durableVoice = PrivateStorageService.getVoiceInvalidationRecord(voiceId);
 
-    // Ownership check: If voice has owner or audit record has owner, non-owners cannot revoke (unless admin)
-    const resourceOwnerId = targetVoice?.userId || auditRecord?.userId;
-    const isAdmin = req.user?.role === 'admin' || effectiveUserId === 'usr_admin_root';
-    if (resourceOwnerId && resourceOwnerId !== effectiveUserId && !isAdmin) {
+    if (!targetVoice && !auditRecord && !durableVoice) {
+      return res.status(404).json({
+        success: false,
+        error: 'Voice consent record not found',
+        code: 'VOICE_NOT_FOUND',
+      });
+    }
+
+    // Ownership check: Non-admins must explicitly own the voice or consent record (fails closed if unowned/premade)
+    const resourceOwnerId = auditRecord?.userId || targetVoice?.userId || durableVoice?.ownerId;
+    if (!isAdmin && (!resourceOwnerId || resourceOwnerId !== callerId)) {
       logAuditEvent({
-        userId: effectiveUserId,
+        userId: callerId,
         eventType: 'consent_revocation_denied_not_owner',
         resourceId: voiceId,
         status: 'denied',
-        details: { resourceOwnerId },
+        details: { resourceOwnerId: resourceOwnerId || null },
       });
       return res.status(403).json({
         success: false,
@@ -672,71 +1159,204 @@ apiRouter.post('/voices/clone/revoke-consent', optionalAuth, (req, res) => {
       });
     }
 
-    const success = ConsentVerificationEngine.revokeConsent(voiceId, effectiveUserId);
-    if (!success && !targetVoice) {
-      return res.status(404).json({ success: false, error: 'Voice consent record not found' });
+    const success = ConsentVerificationEngine.revokeConsent(voiceId, callerId, {
+      isAdmin,
+      recordRevocationMarker: true,
+      resourceOwnerId,
+    });
+    if (!success) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden: You do not own this voice profile or its consent record.',
+        code: 'FORBIDDEN_NOT_OWNER',
+      });
     }
 
     // Update memoryStore consent record
     const cr = memoryStore.consentRecords.find((r: any) => r.voiceId === voiceId);
     if (cr) {
       cr.status = 'revoked';
-      cr.revokedAt = new Date().toISOString();
+      cr.revokedAt = cr.revokedAt || new Date().toISOString();
     }
 
     // Remove from active catalog
     customVoices = customVoices.filter((v) => v.id !== voiceId);
     memoryStore.customVoices = customVoices;
 
+    // Eagerly scrub all synthesis jobs for this voice and invalidate/delete corresponding private media artifacts
+    const cleanup = await purgeVoiceArtifactsAndJobs({
+      voiceId,
+      actorUserId: callerId,
+      isAdmin,
+      reason: 'consent_revoked',
+      errorMessage: 'Biometric consent for this voice profile has been revoked by the owner.',
+    });
+
+    if (cleanup.durableInvalidationFailedCount > 0) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'consent_revocation_durability_failed',
+        resourceId: voiceId,
+        status: 'failure',
+        details: {
+          action: 'revocation',
+          actorRole: req.user!.role,
+          scrubbedJobsCount: cleanup.scrubbedJobsCount,
+          invalidatedMediaCount: cleanup.invalidatedMediaCount,
+          cleanupFailuresCount: cleanup.cleanupFailuresCount,
+        },
+      });
+      return res.status(503).json({
+        success: false,
+        error:
+          'Consent revocation took effect in memory, but durable storage invalidation could not be persisted.',
+        code: 'STORAGE_UNAVAILABLE',
+        cleanupFailed: true,
+      });
+    }
+
+    pendingDeletedVoices.delete(voiceId);
+
     logAuditEvent({
-      userId: effectiveUserId,
+      userId: callerId,
       eventType: 'consent_revoked',
       resourceId: voiceId,
       status: 'success',
-      details: { action: 'revocation' },
+      details: {
+        action: 'revocation',
+        actorRole: req.user!.role,
+        scrubbedJobsCount: cleanup.scrubbedJobsCount,
+        invalidatedMediaCount: cleanup.invalidatedMediaCount,
+        cleanupFailuresCount: cleanup.cleanupFailuresCount,
+      },
     });
 
     res.json({
       success: true,
       voiceId,
+      scrubbedJobsCount: cleanup.scrubbedJobsCount,
+      invalidatedMediaCount: cleanup.invalidatedMediaCount,
+      cleanupFailed: cleanup.cleanupFailuresCount > 0,
       message: `Biometric consent revoked. Voice profile "${voiceId}" permanently disabled.`,
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        success: false,
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// 5. Delete Voice Profile (Ownership protected)
-apiRouter.delete('/voices/:id', optionalAuth, (req, res) => {
-  const { id } = req.params;
-  const effectiveUserId = req.user ? req.user.id : 'usr_default_creator';
-  const isAdmin = req.user?.role === 'admin' || effectiveUserId === 'usr_admin_root';
+// 5. Delete Voice Profile (Strictly authenticated & ownership protected)
+apiRouter.delete('/voices/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
 
-  const voice = customVoices.find((v) => v.id === id);
-  if (voice && voice.userId && voice.userId !== effectiveUserId && !isAdmin) {
-    return res.status(403).json({
-      error: 'Forbidden: You do not own this voice profile',
-      code: 'FORBIDDEN_NOT_OWNER',
+    const voice = customVoices.find((v) => v.id === id) || pendingDeletedVoices.get(id);
+    if (!voice) {
+      return res.status(404).json({
+        error: 'Voice not found',
+        code: 'VOICE_NOT_FOUND',
+      });
+    }
+
+    if (!isAdmin && (!voice.userId || voice.userId !== callerId)) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'voice_delete_denied_not_owner',
+        resourceId: id,
+        status: 'denied',
+        details: { voiceOwnerId: voice.userId || null },
+      });
+      return res.status(403).json({
+        error: 'Forbidden: You do not own this voice profile',
+        code: 'FORBIDDEN_NOT_OWNER',
+      });
+    }
+
+    const isPrivate = !isPublicVoice(voice);
+    ConsentVerificationEngine.revokeConsent(id, callerId, {
+      isAdmin,
+      recordRevocationMarker: isPrivate,
+      resourceOwnerId: voice.userId,
     });
+    const cr = memoryStore.consentRecords.find((r: any) => r.voiceId === id);
+    if (cr && isPrivate) {
+      cr.status = 'revoked';
+      cr.revokedAt = cr.revokedAt || new Date().toISOString();
+    }
+
+    pendingDeletedVoices.set(id, voice);
+    customVoices = customVoices.filter((v) => v.id !== id);
+    memoryStore.customVoices = customVoices;
+
+    const cleanup = await purgeVoiceArtifactsAndJobs({
+      voiceId: id,
+      actorUserId: callerId,
+      isAdmin,
+      reason: isPrivate ? 'consent_revoked' : 'voice_deleted',
+      errorMessage: 'Voice profile deleted and biometric consent revoked.',
+    });
+
+    if (cleanup.durableInvalidationFailedCount > 0) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'voice_delete_durability_failed',
+        resourceId: id,
+        status: 'failure',
+        details: {
+          scrubbedJobsCount: cleanup.scrubbedJobsCount,
+          invalidatedMediaCount: cleanup.invalidatedMediaCount,
+          cleanupFailuresCount: cleanup.cleanupFailuresCount,
+        },
+      });
+      return res.status(503).json({
+        success: false,
+        error:
+          'Voice deletion took effect in memory, but durable storage invalidation could not be persisted.',
+        code: 'STORAGE_UNAVAILABLE',
+        cleanupFailed: true,
+      });
+    }
+
+    pendingDeletedVoices.delete(id);
+
+    logAuditEvent({
+      userId: callerId,
+      eventType: 'voice_deleted',
+      resourceId: id,
+      status: 'success',
+      details: {
+        scrubbedJobsCount: cleanup.scrubbedJobsCount,
+        invalidatedMediaCount: cleanup.invalidatedMediaCount,
+        cleanupFailuresCount: cleanup.cleanupFailuresCount,
+      },
+    });
+
+    res.json({
+      success: true,
+      voiceId: id,
+      scrubbedJobsCount: cleanup.scrubbedJobsCount,
+      invalidatedMediaCount: cleanup.invalidatedMediaCount,
+      cleanupFailed: cleanup.cleanupFailuresCount > 0,
+      message: `Voice "${id}" removed from catalog.`,
+    });
+  } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        success: false,
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  ConsentVerificationEngine.revokeConsent(id, effectiveUserId);
-  const countBefore = customVoices.length;
-  customVoices = customVoices.filter((v) => v.id !== id);
-  memoryStore.customVoices = customVoices;
-
-  logAuditEvent({
-    userId: effectiveUserId,
-    eventType: 'voice_deleted',
-    resourceId: id,
-    status: 'success',
-  });
-
-  res.json({
-    success: customVoices.length < countBefore,
-    voiceId: id,
-    message: `Voice "${id}" removed from catalog.`,
-  });
 });
 
 // ============================================================================
@@ -745,31 +1365,27 @@ apiRouter.delete('/voices/:id', optionalAuth, (req, res) => {
 
 // Scoped Voice Catalog: premade public voices + caller's private voices
 apiRouter.get('/v1/voices', optionalAuth, (req, res) => {
-  const callerId = req.user?.id;
-  const isAdmin = req.user?.role === 'admin';
-
-  const filtered = customVoices.filter((v) => {
-    if (v.category === 'premade' || v.isPublic) return true;
-    if (isAdmin) return true;
-    return callerId && v.userId === callerId;
-  });
-
-  res.json({ voices: filtered });
+  const filtered = filterVisibleVoices(customVoices, req.user);
+  res.json({ voices: filtered, total: filtered.length });
 });
 
 // Create custom voice owned by authenticated caller
 apiRouter.post('/v1/voices', requireAuth, (req, res) => {
   try {
     const { name, category, gender, primaryLanguage, description, defaultSettings } = req.body;
-    if (!name) {
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
       return res.status(400).json({ error: 'name is required' });
     }
+
+    // Prevent non-admin callers from marking user-created voices as 'premade' (public system catalog)
+    const allowedCategories = ['designed', 'cloned_instant', 'cloned_professional'] as const;
+    const safeCategory = allowedCategories.includes(category) ? category : 'designed';
 
     const voiceId = `voice_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     const newVoice = {
       id: voiceId,
       name: name.trim(),
-      category: (category || 'designed') as any,
+      category: safeCategory as any,
       gender: (gender || 'female') as any,
       primaryLanguage: (primaryLanguage || 'en') as any,
       supportedLanguages: ['en', 'hi', 'ta', 'ml', 'ja'] as SupportedLanguage[],
@@ -805,42 +1421,140 @@ apiRouter.post('/v1/voices', requireAuth, (req, res) => {
   }
 });
 
-// Delete voice owned by authenticated caller
-apiRouter.delete('/v1/voices/:id', requireAuth, (req, res) => {
-  const { id } = req.params;
-  const callerId = req.user!.id;
-  const isAdmin = req.user!.role === 'admin';
+// Delete voice owned by authenticated caller (or admin)
+apiRouter.delete('/v1/voices/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
 
-  const voiceIndex = customVoices.findIndex((v) => v.id === id);
-  if (voiceIndex === -1) {
-    return res.status(404).json({ error: 'Voice not found' });
+    const voiceIndex = customVoices.findIndex((v) => v.id === id);
+    const voice = voiceIndex !== -1 ? customVoices[voiceIndex] : pendingDeletedVoices.get(id);
+    if (!voice) {
+      return res.status(404).json({ error: 'Voice not found', code: 'VOICE_NOT_FOUND' });
+    }
+
+    if (!isAdmin && (!voice.userId || voice.userId !== callerId)) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'voice_delete_denied_not_owner',
+        resourceId: id,
+        status: 'denied',
+        details: { voiceOwnerId: voice.userId || null },
+      });
+      return res.status(403).json({
+        error: 'Forbidden: You do not own this voice profile',
+        code: 'FORBIDDEN_NOT_OWNER',
+      });
+    }
+
+    const isPrivate = !isPublicVoice(voice);
+    ConsentVerificationEngine.revokeConsent(id, callerId, {
+      isAdmin,
+      recordRevocationMarker: isPrivate,
+      resourceOwnerId: voice.userId,
+    });
+    const cr = memoryStore.consentRecords.find((r: any) => r.voiceId === id);
+    if (cr && isPrivate) {
+      cr.status = 'revoked';
+      cr.revokedAt = cr.revokedAt || new Date().toISOString();
+    }
+
+    pendingDeletedVoices.set(id, voice);
+    if (voiceIndex !== -1) {
+      customVoices.splice(voiceIndex, 1);
+      memoryStore.customVoices = customVoices;
+    }
+
+    const cleanup = await purgeVoiceArtifactsAndJobs({
+      voiceId: id,
+      actorUserId: callerId,
+      isAdmin,
+      reason: isPrivate ? 'consent_revoked' : 'voice_deleted',
+      errorMessage: 'Voice profile deleted and biometric consent revoked.',
+    });
+
+    if (cleanup.durableInvalidationFailedCount > 0) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'voice_delete_durability_failed',
+        resourceId: id,
+        status: 'failure',
+        details: {
+          scrubbedJobsCount: cleanup.scrubbedJobsCount,
+          invalidatedMediaCount: cleanup.invalidatedMediaCount,
+          cleanupFailuresCount: cleanup.cleanupFailuresCount,
+        },
+      });
+      return res.status(503).json({
+        success: false,
+        error:
+          'Voice deletion took effect in memory, but durable storage invalidation could not be persisted.',
+        code: 'STORAGE_UNAVAILABLE',
+        cleanupFailed: true,
+      });
+    }
+
+    pendingDeletedVoices.delete(id);
+
+    logAuditEvent({
+      userId: callerId,
+      eventType: 'voice_deleted',
+      resourceId: id,
+      status: 'success',
+      details: {
+        scrubbedJobsCount: cleanup.scrubbedJobsCount,
+        invalidatedMediaCount: cleanup.invalidatedMediaCount,
+        cleanupFailuresCount: cleanup.cleanupFailuresCount,
+      },
+    });
+
+    res.json({
+      success: true,
+      voiceId: id,
+      scrubbedJobsCount: cleanup.scrubbedJobsCount,
+      invalidatedMediaCount: cleanup.invalidatedMediaCount,
+      cleanupFailed: cleanup.cleanupFailuresCount > 0,
+    });
+  } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        success: false,
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  const voice = customVoices[voiceIndex];
-  if (voice.userId && voice.userId !== callerId && !isAdmin) {
-    return res.status(403).json({ error: 'Forbidden: You do not own this voice profile', code: 'FORBIDDEN_NOT_OWNER' });
-  }
-
-  ConsentVerificationEngine.revokeConsent(id, callerId);
-  customVoices.splice(voiceIndex, 1);
-  memoryStore.customVoices = customVoices;
-
-  logAuditEvent({
-    userId: callerId,
-    eventType: 'voice_deleted',
-    resourceId: id,
-    status: 'success',
-  });
-
-  res.json({ success: true, voiceId: id });
 });
 
 // Private Media Upload with Magic-Byte Inspection
 apiRouter.post('/v1/media/upload', mediaUploadRateLimiter, requireAuth, async (req, res) => {
   try {
-    const { audioBase64, filename, mediaType } = req.body;
+    const { audioBase64, filename, mediaType, voiceId } = req.body;
     if (!audioBase64 || typeof audioBase64 !== 'string') {
       return res.status(400).json({ error: 'audioBase64 string is required' });
+    }
+
+    let linkedVoiceId: string | undefined;
+    if (typeof voiceId === 'string' && voiceId.trim().length > 0) {
+      const trimmedVoiceId = voiceId.trim();
+      if (isPositivelyConsentRevoked(trimmedVoiceId)) {
+        return res.status(403).json({
+          error: 'Upload prohibited: Biometric consent for this voice profile has been revoked.',
+          code: 'CONSENT_REVOKED',
+        });
+      }
+      syncDurableVoiceState(trimmedVoiceId);
+      const targetVoice = customVoices.find((v) => v.id === trimmedVoiceId);
+      if (!targetVoice) {
+        return res.status(404).json({ error: 'Voice not found', code: 'VOICE_NOT_FOUND' });
+      }
+      const access = checkVoiceAccess(targetVoice, req.user);
+      if (!access.allowed) {
+        return res.status(access.status).json({ error: access.error, code: access.code });
+      }
+      linkedVoiceId = targetVoice.id;
     }
 
     const cleanBase64 = audioBase64.includes('base64,') ? audioBase64.split('base64,')[1] : audioBase64;
@@ -848,6 +1562,7 @@ apiRouter.post('/v1/media/upload', mediaUploadRateLimiter, requireAuth, async (r
 
     const mediaRecord = await PrivateStorageService.storeMedia({
       userId: req.user!.id,
+      voiceId: linkedVoiceId,
       mediaType: mediaType || 'reference_audio',
       filename: filename || 'uploaded_sample.wav',
       buffer,
@@ -868,25 +1583,143 @@ apiRouter.post('/v1/media/upload', mediaUploadRateLimiter, requireAuth, async (r
       signedDownloadUrl,
     });
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Private media storage is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     res.status(400).json({ error: err.message });
   }
 });
 
-// Private Media Download (Verifies HMAC signature or bearer token ownership)
+// Private Media Download (Verifies HMAC signature or bearer token ownership, and fails closed on revocation/cancellation)
 apiRouter.get('/v1/media/download/:id', optionalAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { expires, uid, sig } = req.query;
+    const hasSignedParams =
+      typeof expires === 'string' && typeof uid === 'string' && typeof sig === 'string';
+
+    if (!req.user && !hasSignedParams) {
+      return res.status(401).json({
+        error: 'Authentication or signed download URL required',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    // Fail closed if durable media invalidation ledger is unreadable/corrupted
+    PrivateStorageService.assertInvalidationLedgerHealthy();
+
+    // 1. Check authoritative invalidation tombstone registry first
+    const invalidation = PrivateStorageService.getInvalidationRecord(id);
+    if (invalidation) {
+      const expNum = hasSignedParams ? parseInt(expires as string, 10) : NaN;
+      const validHistoricalSig =
+        hasSignedParams &&
+        !Number.isNaN(expNum) &&
+        PrivateStorageService.hasValidSignedUrlForInvalidatedMedia(id, uid as string, expNum, sig as string);
+      const validBearerOwner = Boolean(
+        req.user && (req.user.id === invalidation.ownerId || req.user.role === 'admin')
+      );
+
+      if (!validHistoricalSig && !validBearerOwner) {
+        logAuditEvent({
+          userId: req.user ? req.user.id : typeof uid === 'string' ? uid : 'anonymous',
+          eventType: 'unauthorized_media_access_attempt',
+          resourceId: id,
+          status: 'denied',
+        });
+        return res.status(403).json({
+          error: 'Forbidden: Invalid or expired signed download URL',
+          code: 'FORBIDDEN_MEDIA_ACCESS',
+        });
+      }
+
+      if (
+        invalidation.reason === 'consent_revoked' ||
+        (invalidation.voiceId && !isVoiceConsentVerifiedActive(invalidation.voiceId))
+      ) {
+        logAuditEvent({
+          userId: req.user ? req.user.id : typeof uid === 'string' ? uid : invalidation.ownerId,
+          eventType: 'media_download_blocked_revoked_consent',
+          resourceId: id,
+          status: 'denied',
+          details: { voiceId: invalidation.voiceId || null },
+        });
+        return res.status(403).json({
+          error: 'Forbidden: Biometric consent for the voice profile associated with this media artifact has been revoked.',
+          code: 'CONSENT_REVOKED',
+        });
+      }
+
+      logAuditEvent({
+        userId: req.user ? req.user.id : typeof uid === 'string' ? uid : invalidation.ownerId,
+        eventType: 'media_download_blocked_invalidated_artifact',
+        resourceId: id,
+        status: 'denied',
+        details: { reason: invalidation.reason },
+      });
+      return res.status(403).json({
+        error: 'Forbidden: This media artifact has been cancelled or deleted and is permanently inaccessible.',
+        code: 'MEDIA_ARTIFACT_INVALIDATED',
+      });
+    }
 
     const mediaMeta = (memoryStore.privateMedia as PrivateMediaRecord[]).find((m) => m.id === id);
     if (!mediaMeta) {
       return res.status(404).json({ error: 'Media not found' });
     }
 
-    // Consent revocation check: Reject access if voice consent is revoked
-    if (mediaMeta.voiceId && !ConsentVerificationEngine.isConsentActive(mediaMeta.voiceId)) {
+    // 2. Verify caller authorization (signed URL HMAC or Bearer owner/admin) BEFORE inspecting lifecycle state
+    let isAuthorized = false;
+
+    if (hasSignedParams) {
+      const expNum = parseInt(expires as string, 10);
+      const validSig = PrivateStorageService.verifySignedUrl(id, uid as string, expNum, sig as string);
+      if (validSig && uid === mediaMeta.userId) {
+        isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized && req.user) {
+      if (req.user.id === mediaMeta.userId || req.user.role === 'admin') {
+        isAuthorized = true;
+      }
+    }
+
+    if (!isAuthorized) {
       logAuditEvent({
-        userId: req.user ? req.user.id : (typeof uid === 'string' ? uid : mediaMeta.userId),
+        userId: req.user ? req.user.id : typeof uid === 'string' ? uid : 'anonymous',
+        eventType: 'unauthorized_media_access_attempt',
+        resourceId: id,
+        status: 'denied',
+      });
+      return res.status(403).json({
+        error: 'Forbidden: Invalid or expired signed download URL',
+        code: 'FORBIDDEN_MEDIA_ACCESS',
+      });
+    }
+
+    // 3. Fail-closed active biometric consent check (handles out-of-band ConsentVerificationEngine revocations too)
+    if (mediaMeta.voiceId && !isVoiceConsentVerifiedActive(mediaMeta.voiceId)) {
+      const actorId = req.user ? req.user.id : mediaMeta.userId;
+      const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+        mediaId: id,
+        requestingUserId: actorId,
+        isAdmin: req.user?.role === 'admin',
+        allowVoiceOwnerCleanup: true,
+        reason: 'consent_revoked',
+        fallbackOwnerId: mediaMeta.userId,
+        fallbackVoiceId: mediaMeta.voiceId,
+      });
+      recordSanitizedCleanupFailures(actorId, id, [outcome], {
+        voiceId: mediaMeta.voiceId,
+        reason: 'consent_revoked',
+      });
+
+      logAuditEvent({
+        userId: req.user ? req.user.id : typeof uid === 'string' ? uid : mediaMeta.userId,
         eventType: 'media_download_blocked_revoked_consent',
         resourceId: id,
         status: 'denied',
@@ -898,32 +1731,29 @@ apiRouter.get('/v1/media/download/:id', optionalAuth, async (req, res) => {
       });
     }
 
-    let isAuthorized = false;
-
-    // Check signed URL
-    if (typeof expires === 'string' && typeof uid === 'string' && typeof sig === 'string') {
-      const expNum = parseInt(expires, 10);
-      const validSig = PrivateStorageService.verifySignedUrl(id, uid, expNum, sig);
-      if (validSig && uid === mediaMeta.userId) {
-        isAuthorized = true;
-      }
-    }
-
-    // Check Bearer user auth
-    if (!isAuthorized && req.user) {
-      if (req.user.id === mediaMeta.userId || req.user.role === 'admin') {
-        isAuthorized = true;
-      }
-    }
-
-    if (!isAuthorized) {
-      logAuditEvent({
-        userId: req.user ? req.user.id : (typeof uid === 'string' ? uid : 'anonymous'),
-        eventType: 'unauthorized_media_access_attempt',
-        resourceId: id,
-        status: 'denied',
+    // 4. Fail-closed cancelled-job check if any associated synthesis job was cancelled
+    const cancelledJob = (memoryStore.synthesisJobs as any[]).find(
+      (j) => j.outputMediaId === id && j.status === 'cancelled'
+    );
+    if (cancelledJob) {
+      const actorId = req.user ? req.user.id : mediaMeta.userId;
+      const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+        mediaId: id,
+        requestingUserId: actorId,
+        isAdmin: req.user?.role === 'admin',
+        allowVoiceOwnerCleanup: true,
+        reason: 'job_cancelled',
+        fallbackOwnerId: mediaMeta.userId,
+        fallbackVoiceId: mediaMeta.voiceId,
       });
-      return res.status(403).json({ error: 'Forbidden: Invalid or expired signed download URL', code: 'FORBIDDEN_MEDIA_ACCESS' });
+      recordSanitizedCleanupFailures(actorId, id, [outcome], {
+        voiceId: mediaMeta.voiceId,
+        reason: 'job_cancelled',
+      });
+      return res.status(403).json({
+        error: 'Forbidden: This media artifact belongs to a cancelled synthesis job.',
+        code: 'MEDIA_ARTIFACT_INVALIDATED',
+      });
     }
 
     const { buffer, meta } = await PrivateStorageService.getMedia(id, mediaMeta.userId, true);
@@ -939,65 +1769,153 @@ apiRouter.get('/v1/media/download/:id', optionalAuth, async (req, res) => {
   }
 });
 
-// List User's Private Media
-apiRouter.get('/v1/media', requireAuth, (req, res) => {
-  const callerId = req.user!.id;
-  const userMedia = (memoryStore.privateMedia as PrivateMediaRecord[]).filter((m) => m.userId === callerId);
-  res.json({ media: userMedia });
+// List User's Private Media (Fails closed on out-of-band consent revocation & omits internal storage paths)
+apiRouter.get('/v1/media', requireAuth, async (req, res) => {
+  try {
+    PrivateStorageService.assertInvalidationLedgerHealthy();
+
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
+    const snapshot = (memoryStore.privateMedia as PrivateMediaRecord[]).filter(
+      (m) => m.userId === callerId
+    );
+    const safeMedia: Array<Omit<PrivateMediaRecord, 'storageKey'>> = [];
+
+    for (const m of snapshot) {
+      if (PrivateStorageService.isMediaInvalidated(m.id)) {
+        continue;
+      }
+
+      if (m.voiceId && !isVoiceConsentVerifiedActive(m.voiceId)) {
+        const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+          mediaId: m.id,
+          requestingUserId: callerId,
+          isAdmin,
+          allowVoiceOwnerCleanup: true,
+          reason: 'consent_revoked',
+          fallbackOwnerId: m.userId,
+          fallbackVoiceId: m.voiceId,
+        });
+        recordSanitizedCleanupFailures(callerId, m.id, [outcome], {
+          voiceId: m.voiceId,
+          reason: 'consent_revoked',
+        });
+        continue;
+      }
+
+      const cancelledJob = (memoryStore.synthesisJobs as any[]).some(
+        (j) => j.outputMediaId === m.id && j.status === 'cancelled'
+      );
+      if (cancelledJob) {
+        const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+          mediaId: m.id,
+          requestingUserId: callerId,
+          isAdmin,
+          allowVoiceOwnerCleanup: true,
+          reason: 'job_cancelled',
+          fallbackOwnerId: m.userId,
+          fallbackVoiceId: m.voiceId,
+        });
+        recordSanitizedCleanupFailures(callerId, m.id, [outcome], {
+          voiceId: m.voiceId,
+          reason: 'job_cancelled',
+        });
+        continue;
+      }
+
+      const { storageKey: _omitStorageKey, ...sanitizedRecord } = m;
+      safeMedia.push(sanitizedRecord);
+    }
+
+    PrivateStorageService.assertInvalidationLedgerHealthy();
+
+    res.json({ media: safeMedia });
+  } catch (err: any) {
+    if (err.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Create Stateful Synthesis Job (Asynchronous / Tracked with Phase 3A Security)
-apiRouter.post('/v1/tts/jobs', synthesisJobRateLimiter, optionalAuth, async (req, res) => {
+// Create Stateful Synthesis Job (Strictly authenticated & tenant-isolated)
+apiRouter.post('/v1/tts/jobs', synthesisJobRateLimiter, requireAuth, async (req, res) => {
   try {
     const { text, voiceId, language, settings, format, idempotencyKey } = req.body;
     if (!text || !voiceId) {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'text and voiceId are required fields' } });
     }
 
-    const effectiveUserId = req.user ? req.user.id : 'usr_default_creator';
-    // 1. Biometric consent revocation check by voiceId
-    const consentRecord = ConsentVerificationEngine.getAuditRecord(voiceId);
-    if (consentRecord && (consentRecord.status === 'revoked' || !ConsentVerificationEngine.isConsentActive(voiceId))) {
+    const callerId = req.user!.id;
+
+    // 1. Biometric consent revocation check by voiceId (consults shared durable ledger + engine)
+    if (isPositivelyConsentRevoked(voiceId)) {
       return res.status(403).json({
         error: `Synthesis prohibited: Biometric consent for cloned voice has been revoked by the owner.`,
         code: 'CONSENT_REVOKED',
       });
     }
 
+    syncDurableVoiceState(voiceId);
+
     const voice = customVoices.find((v) => v.id === voiceId);
     if (!voice) {
       return res.status(404).json({ error: { code: 'VOICE_NOT_FOUND', message: `Voice '${voiceId}' not found` } });
     }
 
-    // Check voice consent & tenant ownership for cloned voices
-    if (voice.category === 'cloned_instant' || voice.category === 'cloned_professional') {
-      if (voice.userId && voice.userId !== effectiveUserId && (!req.user || req.user.role !== 'admin') && !voice.isPublic) {
-        return res.status(403).json({ error: 'Forbidden: You do not own this voice profile', code: 'FORBIDDEN_NOT_OWNER' });
+    // 2. Check voice tenant ownership for all private voices
+    const access = checkVoiceAccess(voice, req.user);
+    if (!access.allowed) {
+      return res.status(access.status).json({ error: access.error, code: access.code });
+    }
+
+    // Stateful jobs always persist private media; fail closed BEFORE synthesizing if ledger is unhealthy
+    PrivateStorageService.assertInvalidationLedgerHealthy();
+
+    // 3. Tenant-scoped idempotency check (never shares or collides across tenants)
+    const cleanIdempotencyKey =
+      typeof idempotencyKey === 'string' && idempotencyKey.trim().length > 0
+        ? idempotencyKey.trim()
+        : undefined;
+    if (cleanIdempotencyKey) {
+      const existingJob = (memoryStore.synthesisJobs as any[]).find(
+        (j) =>
+          j.userId === callerId &&
+          j.idempotencyKey === cleanIdempotencyKey &&
+          j.status !== 'cancelled' &&
+          !PrivateStorageService.isMediaInvalidated(j.outputMediaId)
+      );
+      if (existingJob && isVoiceConsentVerifiedActive(existingJob.voiceId)) {
+        return res.status(202).json(serializeSafeSynthesisJob(existingJob));
       }
     }
 
-    const jobId = idempotencyKey || `job_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    const jobId = `job_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
     const result = await synthesizer.synthesize(
       { text, voiceId, language, settings, format },
       voice
     );
 
-    // Save audio into private storage
+    // Save audio into private storage owned strictly by callerId
     const audioBuffer = Buffer.from(result.audioBase64, 'base64');
     const mediaRecord = await PrivateStorageService.storeMedia({
-      userId: effectiveUserId,
+      userId: callerId,
       mediaType: 'tts_output',
       filename: `tts_${jobId}.wav`,
       buffer: audioBuffer,
       voiceId: voice.id,
     });
 
-    const outputSignedUrl = PrivateStorageService.generateSignedDownloadUrl(mediaRecord.id, effectiveUserId);
+    const outputSignedUrl = PrivateStorageService.generateSignedDownloadUrl(mediaRecord.id, callerId);
 
     const job = {
       id: jobId,
       jobId,
-      userId: effectiveUserId,
+      userId: callerId,
+      idempotencyKey: cleanIdempotencyKey,
       voiceId: voice.id,
       status: 'completed' as const,
       executionMode: result.executionMode,
@@ -1023,7 +1941,7 @@ apiRouter.post('/v1/tts/jobs', synthesisJobRateLimiter, optionalAuth, async (req
     asyncJobsLedger.set(jobId, job as any);
 
     logAuditEvent({
-      userId: effectiveUserId,
+      userId: callerId,
       eventType: 'synthesis_job_dispatched',
       resourceId: jobId,
       status: 'success',
@@ -1032,60 +1950,190 @@ apiRouter.post('/v1/tts/jobs', synthesisJobRateLimiter, optionalAuth, async (req
 
     res.status(202).json(job);
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
 
-// List User's Synthesis Jobs
-apiRouter.get('/v1/tts/jobs', requireAuth, (req, res) => {
-  const callerId = req.user!.id;
-  const userJobs = (memoryStore.synthesisJobs as any[]).filter((j) => j.userId === callerId);
-  res.json({ jobs: userJobs });
+// List User's Synthesis Jobs (Enforces fail-closed active biometric consent & invalidation scrubbing per job)
+apiRouter.get('/v1/tts/jobs', requireAuth, async (req, res) => {
+  try {
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
+    const userJobs = (memoryStore.synthesisJobs as any[]).filter((j) => j.userId === callerId);
+    const safeJobs: Record<string, any>[] = [];
+
+    // 1. Always scrub genuinely consent-revoked jobs first (independent of ledger health)
+    for (const job of userJobs) {
+      if (!isVoiceConsentVerifiedActive(job.voiceId)) {
+        const mediaId = scrubJobAudioArtifactsInMemory(
+          job,
+          'Biometric consent for this voice profile has been revoked by the owner.'
+        );
+        const ledgerJob = asyncJobsLedger.get(job.id);
+        if (ledgerJob && ledgerJob !== job) {
+          scrubJobAudioArtifactsInMemory(
+            ledgerJob,
+            'Biometric consent for this voice profile has been revoked by the owner.'
+          );
+        }
+        if (mediaId) {
+          const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+            mediaId,
+            requestingUserId: callerId,
+            isAdmin,
+            allowVoiceOwnerCleanup: true,
+            reason: 'consent_revoked',
+            fallbackOwnerId: job.userId,
+            fallbackVoiceId: job.voiceId,
+          });
+          recordSanitizedCleanupFailures(callerId, job.id, [outcome], {
+            voiceId: job.voiceId,
+            reason: 'consent_revoked',
+          });
+        }
+      }
+    }
+
+    // 2. Fail closed with 503 if invalidation state is unhealthy rather than mutating valid uncancelled jobs
+    PrivateStorageService.assertInvalidationLedgerHealthy();
+
+    for (const job of userJobs) {
+      if (
+        job.status === 'cancelled' ||
+        (job.outputMediaId && PrivateStorageService.isMediaInvalidated(job.outputMediaId))
+      ) {
+        scrubJobAudioArtifactsInMemory(job, job.error || 'Synthesis job has been cancelled.');
+        const ledgerJob = asyncJobsLedger.get(job.id);
+        if (ledgerJob && ledgerJob !== job) {
+          scrubJobAudioArtifactsInMemory(ledgerJob, job.error || 'Synthesis job has been cancelled.');
+        }
+      }
+
+      safeJobs.push(serializeSafeSynthesisJob(job));
+    }
+
+    res.json({ jobs: safeJobs });
+  } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Get Synthesis Job by ID (Ownership protected)
-apiRouter.get('/v1/tts/jobs/:id', requireAuth, (req, res) => {
-  const { id } = req.params;
-  const callerId = req.user!.id;
-  const isAdmin = req.user!.role === 'admin';
+// Get Synthesis Job by ID (Strictly authenticated & ownership protected)
+apiRouter.get('/v1/tts/jobs/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
 
-  const job = (memoryStore.synthesisJobs as any[]).find((j) => j.id === id);
-  if (!job) {
-    return res.status(404).json({ error: 'Synthesis job not found' });
+    const job = (memoryStore.synthesisJobs as any[]).find((j) => j.id === id);
+    if (!job) {
+      return res.status(404).json({ error: 'Synthesis job not found', code: 'JOB_NOT_FOUND' });
+    }
+
+    if (!job.userId || (job.userId !== callerId && !isAdmin)) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'unauthorized_job_access_attempt',
+        resourceId: id,
+        status: 'denied',
+        details: { jobOwnerId: job.userId || null },
+      });
+      return res.status(403).json({
+        error: 'Forbidden: You do not own this synthesis job',
+        code: 'FORBIDDEN_NOT_OWNER',
+      });
+    }
+
+    // Active consent check: If consent for the cloned voice was revoked or unavailable, scrub audio & reject access
+    if (job.voiceId && !isVoiceConsentVerifiedActive(job.voiceId)) {
+      const mediaId = scrubJobAudioArtifactsInMemory(
+        job,
+        'Biometric consent for this voice profile has been revoked by the owner.'
+      );
+      const ledgerJob = asyncJobsLedger.get(id);
+      if (ledgerJob && ledgerJob !== job) {
+        scrubJobAudioArtifactsInMemory(
+          ledgerJob,
+          'Biometric consent for this voice profile has been revoked by the owner.'
+        );
+      }
+      if (mediaId) {
+        const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+          mediaId,
+          requestingUserId: callerId,
+          isAdmin,
+          allowVoiceOwnerCleanup: true,
+          reason: 'consent_revoked',
+          fallbackOwnerId: job.userId,
+          fallbackVoiceId: job.voiceId,
+        });
+        recordSanitizedCleanupFailures(callerId, id, [outcome], {
+          voiceId: job.voiceId,
+          reason: 'consent_revoked',
+        });
+      }
+
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'job_access_blocked_revoked_consent',
+        resourceId: id,
+        status: 'denied',
+        details: { voiceId: job.voiceId },
+      });
+      return res.status(403).json({
+        error: 'Synthesis job cancelled: Biometric consent for cloned voice has been revoked by the owner.',
+        code: 'CONSENT_REVOKED',
+        job: {
+          id: job.id,
+          jobId: job.jobId,
+          status: job.status,
+          voiceId: job.voiceId,
+          error: job.error,
+        },
+      });
+    }
+
+    // Fail closed with 503 if invalidation state is unhealthy rather than mutating a valid uncancelled job
+    PrivateStorageService.assertInvalidationLedgerHealthy();
+
+    if (
+      job.status === 'cancelled' ||
+      (job.outputMediaId && PrivateStorageService.isMediaInvalidated(job.outputMediaId))
+    ) {
+      scrubJobAudioArtifactsInMemory(job, job.error || 'Synthesis job has been cancelled.');
+      const ledgerJob = asyncJobsLedger.get(id);
+      if (ledgerJob && ledgerJob !== job) {
+        scrubJobAudioArtifactsInMemory(ledgerJob, ledgerJob.error || 'Synthesis job has been cancelled.');
+      }
+    }
+
+    res.json({ job: serializeSafeSynthesisJob(job) });
+  } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: err.message });
   }
-
-  if (job.userId !== callerId && !isAdmin) {
-    return res.status(403).json({ error: 'Forbidden: You do not own this synthesis job', code: 'FORBIDDEN_NOT_OWNER' });
-  }
-
-  // Active consent check: If consent for the cloned voice was revoked, reject access and mark job cancelled
-  if (job.voiceId && !ConsentVerificationEngine.isConsentActive(job.voiceId)) {
-    job.status = 'cancelled';
-    job.error = 'Biometric consent for this voice profile has been revoked by the owner.';
-    logAuditEvent({
-      userId: callerId,
-      eventType: 'job_access_blocked_revoked_consent',
-      resourceId: id,
-      status: 'denied',
-      details: { voiceId: job.voiceId },
-    });
-    return res.status(403).json({
-      error: 'Synthesis job cancelled: Biometric consent for cloned voice has been revoked by the owner.',
-      code: 'CONSENT_REVOKED',
-      job,
-    });
-  }
-
-  res.json({ job });
 });
 
-// Query Audit Trail
-apiRouter.get('/v1/audit/events', requireAuth, (req, res) => {
-  const callerId = req.user!.id;
-  const isAdmin = req.user!.role === 'admin';
-
-  const events = (memoryStore.auditEvents as any[]).filter((e) => isAdmin || e.userId === callerId);
-  res.json({ events });
+// Query Security Audit Trail (Privileged admin-only route)
+apiRouter.get('/v1/audit/events', requireAuth, requireRole('admin'), (_req, res) => {
+  res.json({ events: memoryStore.auditEvents });
 });
 
 // Query User Consent Records
@@ -1098,9 +2146,9 @@ apiRouter.get('/v1/consent/records', requireAuth, (req, res) => {
 });
 
 // ============================================================================
-// VOICE SAMPLE UPLOAD & CROSS-LINGUAL CLONING
+// VOICE SAMPLE UPLOAD & CROSS-LINGUAL CLONING (Authenticated & Tenant-Scoped)
 // ============================================================================
-apiRouter.post('/voices/upload-sample', async (req, res) => {
+apiRouter.post('/voices/upload-sample', requireAuth, async (req, res) => {
   try {
     const {
       voiceName,
@@ -1124,8 +2172,8 @@ apiRouter.post('/voices/upload-sample', async (req, res) => {
     // Run acoustic quality check
     const qualityReport = synthesizer.analyzeVoiceSampleQuality(duration);
 
-    // Create unique cloned voice profile supporting all 5 languages
-    const clonedVoiceId = `clone_${Date.now()}`;
+    // Create unique cloned voice profile supporting all 5 languages (bound strictly to req.user.id)
+    const clonedVoiceId = `clone_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
     const newEmbedding = generateSpeakerEmbedding(clonedVoiceId + '_' + voiceName);
     const newVoice = {
       id: clonedVoiceId,
@@ -1137,6 +2185,8 @@ apiRouter.post('/voices/upload-sample', async (req, res) => {
       accent: 'Custom Cloned Timbre',
       description: description || `Cloned from uploaded sample "${filename || 'audio_sample.wav'}" (${duration.toFixed(1)}s). Ready for cross-lingual synthesis in EN, TA, HI, ML, JA.`,
       speakerEmbedding: newEmbedding,
+      userId: req.user!.id,
+      isPublic: false,
       defaultSettings: {
         stability: 0.88,
         similarity: 0.94,
@@ -1152,6 +2202,7 @@ apiRouter.post('/voices/upload-sample', async (req, res) => {
 
     // Store in active voices catalog
     customVoices = [newVoice, ...customVoices];
+    memoryStore.customVoices = customVoices;
 
     // Generate immediate cross-lingual audio greeting
     const previewPhrases: Record<SupportedLanguage, string> = {
@@ -1190,11 +2241,34 @@ apiRouter.post('/voices/upload-sample', async (req, res) => {
   }
 });
 
-// Cross-lingual synthesis tester for a specific cloned voice
-apiRouter.post('/voices/cross-lingual-test', async (req, res) => {
+// Cross-lingual synthesis tester for a specific voice (enforces consent & private voice ownership)
+apiRouter.post('/voices/cross-lingual-test', optionalAuth, async (req, res) => {
   try {
     const { voiceId, language, text } = req.body;
-    const voice = customVoices.find(v => v.id === voiceId) || customVoices[0];
+    if (voiceId && isPositivelyConsentRevoked(voiceId)) {
+      return res.status(403).json({
+        error: 'Synthesis prohibited: Biometric consent for cloned voice has been revoked by the owner.',
+        code: 'CONSENT_REVOKED',
+      });
+    }
+    if (voiceId) {
+      syncDurableVoiceState(voiceId);
+    }
+
+    const voice = voiceId
+      ? customVoices.find((v) => v.id === voiceId)
+      : customVoices.find((v) => isPublicVoice(v));
+    if (!voice) {
+      return res.status(404).json({ error: `Voice '${voiceId}' not found`, code: 'VOICE_NOT_FOUND' });
+    }
+
+    const access = checkVoiceAccess(voice, req.user);
+    if (!access.allowed) {
+      return res.status(access.status).json({ error: access.error, code: access.code });
+    }
+
+    assertNonPremadeVoiceLedgerHealthy(voice.id);
+
     const targetLang = (language || 'en') as SupportedLanguage;
 
     const sampleTexts: Record<SupportedLanguage, string> = {
@@ -1229,18 +2303,45 @@ apiRouter.post('/voices/cross-lingual-test', async (req, res) => {
       durationSeconds: result.durationSeconds,
     });
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
 
 // ============================================================================
-// VOICE MODEL EXPORT (.JSON / .BIN) FOR OFFLINE DEPLOYMENT
+// VOICE MODEL EXPORT (.JSON / .BIN) FOR OFFLINE DEPLOYMENT (Tenant-Isolated)
 // ============================================================================
-apiRouter.get('/voices/:id/export', (req, res) => {
+apiRouter.get('/voices/:id/export', optionalAuth, (req, res) => {
   try {
     const { id } = req.params;
     const format = (req.query.format as string) === 'bin' ? 'bin' : 'json';
-    const voice = customVoices.find(v => v.id === id) || customVoices[0];
+
+    if (isPositivelyConsentRevoked(id)) {
+      return res.status(403).json({
+        error: 'Export prohibited: Biometric consent for cloned voice has been revoked by the owner.',
+        code: 'CONSENT_REVOKED',
+      });
+    }
+
+    syncDurableVoiceState(id);
+
+    const voice = customVoices.find((v) => v.id === id);
+    if (!voice) {
+      return res.status(404).json({ error: `Voice '${id}' not found`, code: 'VOICE_NOT_FOUND' });
+    }
+
+    const access = checkVoiceAccess(voice, req.user);
+    if (!access.allowed) {
+      return res.status(access.status).json({ error: access.error, code: access.code });
+    }
+
+    assertNonPremadeVoiceLedgerHealthy(voice.id);
+
     const embedding = voice.speakerEmbedding || generateSpeakerEmbedding(voice.id + '_' + voice.name);
     const safeName = (voice.name || 'custom_voice').toLowerCase().replace(/[^a-z0-9]/g, '_');
 
@@ -1318,6 +2419,12 @@ apiRouter.get('/voices/:id/export', (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}_model.json"`);
     res.json(modelPayload);
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -1407,8 +2514,11 @@ apiRouter.post('/translate-all', async (req, res) => {
 });
 
 // Unified Multimodal Transcribe & Translate Pipeline (with Dubbing & SRT Generation)
-apiRouter.post('/media/transcribe-translate', async (req, res) => {
+apiRouter.post('/media/transcribe-translate', optionalAuth, async (req, res) => {
   try {
+    // Authoritative server-derived principal only; NEVER trust caller-supplied req.body.userId
+    const ownerUserId: string | null = req.user ? req.user.id : null;
+
     const {
       mediaBase64,
       mimeType = 'audio/mp3',
@@ -1422,6 +2532,43 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
     if (!mediaBase64) {
       return res.status(400).json({ error: 'Audio or video media base64 data is required' });
     }
+
+    // Validate dubbing voice access and active consent up-front if caller specifies dubbingVoiceId
+    const normalizedDubVoiceId =
+      typeof dubbingVoiceId === 'string' && dubbingVoiceId.trim().length > 0
+        ? dubbingVoiceId.trim()
+        : undefined;
+
+    let resolvedDubbingVoice = customVoices.find((v) => isPublicVoice(v)) || customVoices[0];
+    if (normalizedDubVoiceId) {
+      if (isPositivelyConsentRevoked(normalizedDubVoiceId)) {
+        return res.status(403).json({
+          error: 'Synthesis prohibited: Biometric consent for cloned voice has been revoked by the owner.',
+          code: 'CONSENT_REVOKED',
+        });
+      }
+      syncDurableVoiceState(normalizedDubVoiceId);
+      const explicitVoice = customVoices.find((v) => v.id === normalizedDubVoiceId);
+      if (!explicitVoice) {
+        return res.status(404).json({ error: `Voice '${normalizedDubVoiceId}' not found`, code: 'VOICE_NOT_FOUND' });
+      }
+      const access = checkVoiceAccess(explicitVoice, req.user);
+      if (!access.allowed) {
+        return res.status(access.status).json({ error: access.error, code: access.code });
+      }
+      assertNonPremadeVoiceLedgerHealthy(explicitVoice.id);
+      resolvedDubbingVoice = explicitVoice;
+    }
+
+    const usesPrivateVoice = Boolean(resolvedDubbingVoice && !isPublicVoice(resolvedDubbingVoice));
+    if (usesPrivateVoice && !ownerUserId) {
+      return res.status(401).json({
+        error: 'Authentication required to synthesize dubbing with a private voice profile.',
+        code: 'AUTH_REQUIRED',
+      });
+    }
+
+    const isPrivateRecord = Boolean(ownerUserId || usesPrivateVoice);
 
     // 1. Multimodal ASR Transcription
     const asrResult = await multimodal.transcribeMedia({
@@ -1447,12 +2594,24 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
     }));
     const srtContent = generateSrtSubtitles(formattedSegments);
 
+    // Re-verify active biometric consent before synthesizing or persisting dubbing audio
+    if (resolvedDubbingVoice && !isVoiceConsentVerifiedActive(resolvedDubbingVoice.id)) {
+      return res.status(403).json({
+        error: 'Synthesis prohibited: Biometric consent for cloned voice has been revoked by the owner.',
+        code: 'CONSENT_REVOKED',
+      });
+    }
+
+    const jobId = `trans_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
     // 4. Synthesize Audio Dubbing (if requested)
     let dubbedAudioUrl: string | undefined;
     let dubbedDuration: number | undefined;
+    let outputMediaId: string | undefined;
+    let outputSignedUrl: string | undefined;
     if (synthesizeDub && transResult.translatedText) {
       try {
-        const voice = (dubbingVoiceId ? customVoices.find((v) => v.id === dubbingVoiceId) : null) || customVoices[0];
+        const voice = resolvedDubbingVoice;
         const synthRes = await synthesizer.synthesize(
           {
             text: transResult.translatedText,
@@ -1463,17 +2622,44 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
           },
           voice
         );
+
+        // Final mid-flight consent check before materializing private voice audio
+        if (!isVoiceConsentVerifiedActive(voice.id)) {
+          return res.status(403).json({
+            error: 'Synthesis prohibited: Biometric consent for cloned voice has been revoked by the owner.',
+            code: 'CONSENT_REVOKED',
+          });
+        }
+
+        if (ownerUserId) {
+          const dubBuffer = Buffer.from(synthRes.audioBase64, 'base64');
+          const storedDubMedia = await PrivateStorageService.storeMedia({
+            userId: ownerUserId,
+            voiceId: voice.id,
+            mediaType: 'tts_output',
+            filename: `${jobId}.wav`,
+            buffer: dubBuffer,
+          });
+          outputMediaId = storedDubMedia.id;
+          outputSignedUrl = PrivateStorageService.generateSignedDownloadUrl(storedDubMedia.id, ownerUserId);
+        }
+
         dubbedAudioUrl = `data:audio/wav;base64,${synthRes.audioBase64}`;
         dubbedDuration = synthRes.durationSeconds;
       } catch (synthErr: any) {
+        if (synthErr?.name === 'StorageUnavailableError') {
+          throw synthErr;
+        }
         console.warn('[Dubbing synthesis notice]', synthErr.message);
       }
     }
 
-    // 5. Build and Persist Job Record
-    const jobId = `trans_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    const jobRecord = {
+    // 5. Build and Persist Job Record with authoritative server-derived ownership
+    const effectiveVoiceId = synthesizeDub ? resolvedDubbingVoice?.id : normalizedDubVoiceId;
+    const jobRecord: Record<string, any> = {
       id: jobId,
+      userId: ownerUserId,
+      isPrivate: isPrivateRecord,
       mediaTitle,
       sourceLang: asrResult.detectedLanguage,
       sourceLangName: asrResult.detectedLanguageName,
@@ -1485,7 +2671,9 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
       translatedSegments: formattedSegments,
       dubbedAudioUrl,
       dubbedDuration,
-      dubbingVoiceId,
+      dubbingVoiceId: effectiveVoiceId,
+      outputMediaId,
+      outputSignedUrl,
       srtContent,
       confidence: asrResult.confidence,
       status: 'completed',
@@ -1494,12 +2682,16 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
 
     memoryStore.transcriptionJobs.unshift(jobRecord);
 
-    // Persist to PostgreSQL if connected
+    // Persist to PostgreSQL if connected (store inline dubbedAudioUrl only for non-private public records or UUID-backed owners)
     try {
       const { db } = getDatabase();
       if (db) {
+        const dbUserId = ownerUserId && UUID_FORMAT_RE.test(ownerUserId) ? ownerUserId : undefined;
+        // Avoid storing unattributed private audio in PostgreSQL if ownerUserId cannot be represented in UUID column
+        const dbSafeDubbedUrl = !isPrivateRecord || dbUserId ? dubbedAudioUrl : null;
         await db.insert(transcriptionTranslationJobs).values({
           id: jobId,
+          ...(dbUserId ? { userId: dbUserId } : {}),
           mediaTitle,
           sourceLang: asrResult.detectedLanguage,
           sourceLangName: asrResult.detectedLanguageName,
@@ -1509,8 +2701,8 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
           phoneticGuide: transResult.phoneticGuide,
           transcriptSegments: asrResult.segments,
           translatedSegments: formattedSegments,
-          dubbedAudioUrl,
-          dubbingVoiceId,
+          dubbedAudioUrl: dbSafeDubbedUrl,
+          dubbingVoiceId: effectiveVoiceId,
           srtContent,
           confidence: asrResult.confidence,
           status: 'completed',
@@ -1519,6 +2711,8 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
     } catch (dbErr: any) {
       console.warn('[DB transcriptionTranslationJobs notice]', dbErr.message);
     }
+
+    const safeJobRecord = serializeSafeTranscriptionJob(jobRecord);
 
     res.json({
       success: true,
@@ -1531,31 +2725,186 @@ apiRouter.post('/media/transcribe-translate', async (req, res) => {
       phoneticGuide: transResult.phoneticGuide,
       segments: formattedSegments,
       srtContent,
-      dubbedAudioUrl,
-      jobRecord,
+      dubbedAudioUrl: safeJobRecord.dubbedAudioUrl,
+      jobRecord: safeJobRecord,
     });
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     console.error('Unified transcribe-translate error:', err);
     res.status(500).json({ error: err.message || 'Transcribe & Translate failed' });
   }
 });
 
-// List Recent Transcription & Translation Jobs
-apiRouter.get('/media/jobs', async (_req, res) => {
+// List Recent Transcription & Translation Jobs (Tenant-isolated & active-consent enforced)
+apiRouter.get('/media/jobs', optionalAuth, async (req, res) => {
   try {
-    const { db } = getDatabase();
-    if (db) {
+    const caller = req.user;
+    const isAdmin = caller?.role === 'admin';
+
+    let source: 'postgresql' | 'memory' = 'memory';
+    let candidateJobs: Array<any> = memoryStore.transcriptionJobs as Array<any>;
+
+    const { db, isConnected } = getDatabase();
+    if (db && isConnected) {
       try {
-        const rows = await db.select().from(transcriptionTranslationJobs).limit(25);
+        const rows = await db.select().from(transcriptionTranslationJobs).limit(50);
         if (rows && rows.length > 0) {
-          return res.json({ jobs: rows, source: 'postgresql' });
+          candidateJobs = rows;
+          source = 'postgresql';
         }
       } catch (dbErr: any) {
         console.warn('[DB fetch transcriptionTranslationJobs notice]', dbErr.message);
       }
     }
-    res.json({ jobs: memoryStore.transcriptionJobs, source: 'memory' });
+
+    const visibleSafeJobs: Array<Record<string, any>> = [];
+
+    for (const job of candidateJobs) {
+      if (!job || typeof job !== 'object') continue;
+
+      const privateJob = isPrivateTranscriptionJob(job);
+      if (privateJob) {
+        if (!caller) {
+          continue;
+        }
+        const isOwner = typeof job.userId === 'string' && job.userId.length > 0 && job.userId === caller.id;
+        if (!isOwner && !isAdmin) {
+          continue;
+        }
+      }
+
+      const dubVoiceId =
+        typeof job.dubbingVoiceId === 'string' && job.dubbingVoiceId.trim().length > 0
+          ? job.dubbingVoiceId.trim()
+          : undefined;
+
+      if (dubVoiceId && !isVoiceConsentVerifiedActive(dubVoiceId)) {
+        const actorId = caller?.id || job.userId || 'system';
+        const mediaId = scrubTranscriptionJobArtifactsInMemory(
+          job,
+          'Biometric consent for this voice profile has been revoked by the owner.'
+        );
+        if (mediaId) {
+          const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+            mediaId,
+            requestingUserId: actorId,
+            isAdmin: Boolean(isAdmin),
+            allowVoiceOwnerCleanup: true,
+            reason: 'consent_revoked',
+            fallbackOwnerId: job.userId || undefined,
+            fallbackVoiceId: dubVoiceId,
+          });
+          recordSanitizedCleanupFailures(actorId, job.id, [outcome], {
+            voiceId: dubVoiceId,
+            reason: 'consent_revoked',
+          });
+        }
+        await scrubTranscriptionJobsInDatabaseByVoiceId(dubVoiceId);
+      } else if (job.status === 'cancelled') {
+        scrubTranscriptionJobArtifactsInMemory(job, job.error || 'Media dubbing job has been invalidated.');
+      } else if (typeof job.outputMediaId === 'string' && job.outputMediaId.length > 0) {
+        PrivateStorageService.assertInvalidationLedgerHealthy();
+        if (PrivateStorageService.isMediaInvalidated(job.outputMediaId)) {
+          scrubTranscriptionJobArtifactsInMemory(job, job.error || 'Media dubbing job has been invalidated.');
+        }
+      }
+
+      visibleSafeJobs.push(serializeSafeTranscriptionJob(job));
+      if (visibleSafeJobs.length >= 25) break;
+    }
+
+    res.json({ jobs: visibleSafeJobs, source });
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get Single Transcription & Translation Job by ID (Strictly authenticated & tenant-owned; zero existence leak)
+apiRouter.get('/media/jobs/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const caller = req.user!;
+    const isAdmin = caller.role === 'admin';
+
+    const job = (memoryStore.transcriptionJobs as any[]).find((j) => j && j.id === id);
+    if (!job) {
+      return res.status(404).json({ error: 'Media job not found', code: 'JOB_NOT_FOUND' });
+    }
+
+    if (isPrivateTranscriptionJob(job)) {
+      const isOwner = typeof job.userId === 'string' && job.userId.length > 0 && job.userId === caller.id;
+      if (!isOwner && !isAdmin) {
+        logAuditEvent({
+          userId: caller.id,
+          eventType: 'unauthorized_media_job_access_attempt',
+          resourceId: id,
+          status: 'denied',
+          details: { jobOwnerId: job.userId || null },
+        });
+        return res.status(404).json({ error: 'Media job not found', code: 'JOB_NOT_FOUND' });
+      }
+    }
+
+    const dubVoiceId =
+      typeof job.dubbingVoiceId === 'string' && job.dubbingVoiceId.trim().length > 0
+        ? job.dubbingVoiceId.trim()
+        : undefined;
+
+    if (dubVoiceId && !isVoiceConsentVerifiedActive(dubVoiceId)) {
+      const mediaId = scrubTranscriptionJobArtifactsInMemory(
+        job,
+        'Biometric consent for this voice profile has been revoked by the owner.'
+      );
+      if (mediaId) {
+        const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+          mediaId,
+          requestingUserId: caller.id,
+          isAdmin,
+          allowVoiceOwnerCleanup: true,
+          reason: 'consent_revoked',
+          fallbackOwnerId: job.userId || caller.id,
+          fallbackVoiceId: dubVoiceId,
+        });
+        recordSanitizedCleanupFailures(caller.id, id, [outcome], {
+          voiceId: dubVoiceId,
+          reason: 'consent_revoked',
+        });
+      }
+      await scrubTranscriptionJobsInDatabaseByVoiceId(dubVoiceId);
+      return res.status(403).json({
+        error: 'Media dubbing output prohibited: Biometric consent for cloned voice has been revoked by the owner.',
+        code: 'CONSENT_REVOKED',
+      });
+    }
+
+    if (job.status === 'cancelled') {
+      scrubTranscriptionJobArtifactsInMemory(job, job.error || 'Media dubbing job has been invalidated.');
+    } else if (typeof job.outputMediaId === 'string' && job.outputMediaId.length > 0) {
+      PrivateStorageService.assertInvalidationLedgerHealthy();
+      if (PrivateStorageService.isMediaInvalidated(job.outputMediaId)) {
+        scrubTranscriptionJobArtifactsInMemory(job, job.error || 'Media dubbing job has been invalidated.');
+      }
+    }
+
+    res.json({ job: serializeSafeTranscriptionJob(job) });
+  } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -2027,9 +3376,9 @@ function generatePlaceholderImageSvg(prompt: string, aspectRatio: string): strin
 }
 
 // ============================================================================
-// 6. VOICESTUDIO FEATURE: VOICE DESIGN (Prompt to Voice Persona)
+// 6. VOICESTUDIO FEATURE: VOICE DESIGN (Prompt to Voice Persona - Authenticated & Tenant-Scoped)
 // ============================================================================
-apiRouter.post('/voices/design', (req, res) => {
+apiRouter.post('/voices/design', requireAuth, (req, res) => {
   try {
     const { name, prompt, gender, language, age, accent } = req.body;
     if (!name || !prompt) {
@@ -2047,7 +3396,7 @@ apiRouter.post('/voices/design', (req, res) => {
     const instruct = `${targetGender}, ${age || 'adult'}, ${prompt}, ${accent || 'standard'}`;
 
     const newVoice = {
-      id: `designed_${Date.now()}`,
+      id: `designed_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
       name: `${name} (Voice Design)`,
       category: 'designed' as const,
       gender: targetGender,
@@ -2056,6 +3405,8 @@ apiRouter.post('/voices/design', (req, res) => {
       accent: accent || 'Custom Designed Persona',
       description: `${prompt} • Designed voice persona [Age: ${age || 'adult'}]`,
       instruct,
+      userId: req.user!.id,
+      isPublic: false,
       defaultSettings: {
         stability,
         similarity: 0.88,
@@ -2070,6 +3421,7 @@ apiRouter.post('/voices/design', (req, res) => {
     };
 
     customVoices = [newVoice, ...customVoices];
+    memoryStore.customVoices = customVoices;
     res.json({ success: true, voice: newVoice });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -2077,16 +3429,35 @@ apiRouter.post('/voices/design', (req, res) => {
 });
 
 // ============================================================================
-// 7. VOICESTUDIO FEATURE: SPEECH-TO-SPEECH (Voice Changer)
+// 7. VOICESTUDIO FEATURE: SPEECH-TO-SPEECH (Voice Changer - Tenant-Checked)
 // ============================================================================
-apiRouter.post('/speech-to-speech', async (req, res) => {
+apiRouter.post('/speech-to-speech', optionalAuth, async (req, res) => {
   try {
     const { targetVoiceId, audioBase64, preservePitch } = req.body;
     if (!targetVoiceId) {
       return res.status(400).json({ error: 'targetVoiceId is required' });
     }
 
-    const voice = customVoices.find(v => v.id === targetVoiceId) || customVoices[0];
+    if (isPositivelyConsentRevoked(targetVoiceId)) {
+      return res.status(403).json({
+        error: 'Synthesis prohibited: Biometric consent for cloned voice has been revoked by the owner.',
+        code: 'CONSENT_REVOKED',
+      });
+    }
+
+    syncDurableVoiceState(targetVoiceId);
+
+    const voice = customVoices.find((v) => v.id === targetVoiceId);
+    if (!voice) {
+      return res.status(404).json({ error: `Voice '${targetVoiceId}' not found`, code: 'VOICE_NOT_FOUND' });
+    }
+
+    const access = checkVoiceAccess(voice, req.user);
+    if (!access.allowed) {
+      return res.status(access.status).json({ error: access.error, code: access.code });
+    }
+
+    assertNonPremadeVoiceLedgerHealthy(voice.id);
 
     // Synthesizes target voice preserving source speech cadence
     const sampleText = 'Speech-to-speech voice transformation applied. Prosody and emotional cadence preserved in target voice timbre.';
@@ -2111,6 +3482,12 @@ apiRouter.post('/speech-to-speech', async (req, res) => {
       watermarkSignature: result.watermarkSignature,
     });
   } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -2277,13 +3654,16 @@ apiRouter.post('/billing/topup', (req, res) => {
 });
 
 // ============================================================================
-// VERSIONED API CONTRACTS: /api/v1/* (Section 5 Architecture Specification)
+// VERSIONED API CONTRACTS: /api/v1/* (Phase 3C-S1 Hardened Least-Privilege)
 // ============================================================================
 const v1Router = Router();
 
-// In-memory asynchronous jobs ledger for retry-safe idempotency
+// In-memory asynchronous jobs ledger (strictly tenant-bound)
 interface AsyncJobRecord {
   jobId: string;
+  id?: string;
+  userId: string;
+  voiceId?: string;
   type: 'tts' | 'clone' | 'visual_render';
   status: 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
   createdAt: string;
@@ -2291,23 +3671,25 @@ interface AsyncJobRecord {
   progressPercent: number;
   requestPayload: any;
   result?: any;
+  outputSignedUrl?: string;
   error?: string;
 }
 const asyncJobsLedger = new Map<string, AsyncJobRecord>();
 
-// Projects storage
+// Projects storage (seed project marked public; user-created projects strictly tenant-scoped)
 const projectsLedger = new Map<string, any>([
   ['proj_default_01', {
     id: 'proj_default_01',
     title: 'Multilingual Explainer Series',
     targetLanguages: ['en', 'ta', 'hi', 'ml', 'ja'],
     status: 'active',
+    isPublic: true,
     createdAt: new Date().toISOString(),
     scenes: 3,
   }],
 ]);
 
-// 1. Health & Readiness probes
+// 1. Health & Readiness probes (public operational probes)
 v1Router.get('/health/live', (_req, res) => {
   res.json({
     status: 'live',
@@ -2320,8 +3702,9 @@ v1Router.get('/health/live', (_req, res) => {
 v1Router.get('/health/ready', async (_req, res) => {
   const dbHealth = await checkDatabaseHealth();
   const execStatus = await synthesizer.getExecutionStatus();
+  const runtimeEnv = resolveRuntimeEnvironment(process.env.NODE_ENV);
 
-  if (process.env.NODE_ENV === 'production' && execStatus.executionMode === 'UNAVAILABLE') {
+  if (runtimeEnv === 'production' && execStatus.executionMode === 'UNAVAILABLE') {
     return res.status(503).json({
       status: 'unavailable',
       service: 'VoiceForge 2.0 API',
@@ -2347,134 +3730,325 @@ v1Router.get('/health/ready', async (_req, res) => {
   });
 });
 
-// 2. Voice Catalog
-v1Router.get('/voices', (_req, res) => {
-  res.json({
-    voices: customVoices,
-    total: customVoices.length,
-    timestamp: new Date().toISOString(),
-  });
-});
+// 2. Voice Profile Lookup by ID (enforces active consent + private voice ownership)
+// Note: GET /v1/voices, POST /v1/voices, DELETE /v1/voices/:id, and POST /v1/tts/jobs
+// are handled directly by the hardened multi-tenant handlers above (no unauthenticated duplicates).
+v1Router.get('/voices/:id', optionalAuth, (req, res) => {
+  try {
+    const { id } = req.params;
 
-v1Router.get('/voices/:id', (req, res) => {
-  const voice = customVoices.find(v => v.id === req.params.id);
-  if (!voice) {
-    return res.status(404).json({
-      error: { code: 'VOICE_NOT_FOUND', message: `Voice ID '${req.params.id}' does not exist.` },
-    });
+    if (isPositivelyConsentRevoked(id)) {
+      return res.status(403).json({
+        error: 'Access denied: Biometric consent for this voice profile has been revoked.',
+        code: 'CONSENT_REVOKED',
+      });
+    }
+
+    syncDurableVoiceState(id);
+
+    const voice = customVoices.find((v) => v.id === id);
+    if (!voice) {
+      return res.status(404).json({
+        error: { code: 'VOICE_NOT_FOUND', message: `Voice ID '${id}' does not exist.` },
+        code: 'VOICE_NOT_FOUND',
+      });
+    }
+
+    const access = checkVoiceAccess(voice, req.user);
+    if (!access.allowed) {
+      logAuditEvent({
+        userId: req.user ? req.user.id : 'anonymous',
+        eventType: 'unauthorized_voice_read_attempt',
+        resourceId: id,
+        status: 'denied',
+        details: { voiceOwnerId: voice.userId || null, code: access.code },
+      });
+      return res.status(access.status).json({
+        error: access.error,
+        code: access.code,
+      });
+    }
+
+    assertNonPremadeVoiceLedgerHealthy(voice.id);
+
+    res.json(voice);
+  } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: err.message });
   }
-  res.json(voice);
 });
 
-v1Router.delete('/voices/:id', (req, res) => {
-  const { id } = req.params;
-  ConsentVerificationEngine.revokeConsent(id, 'user_active');
-  const countBefore = customVoices.length;
-  customVoices = customVoices.filter(v => v.id !== id);
-  memoryStore.customVoices = customVoices;
-  if (customVoices.length === countBefore) {
-    return res.status(404).json({
-      error: { code: 'VOICE_NOT_FOUND', message: `Voice '${id}' not found.` },
-    });
-  }
-  res.json({
-    success: true,
-    voiceId: id,
-    message: `Voice '${id}' deleted and biometric consent revoked.`,
-  });
-});
-
-// 3. Audio Reference Quality Check
-v1Router.post('/audio/reference', (req, res) => {
+// 3. Audio Reference Quality Check (authenticated v1 endpoint)
+v1Router.post('/audio/reference', requireAuth, (req, res) => {
   const { audioBase64, durationSeconds } = req.body;
   const report = AudioQualityAnalyzer.analyze(audioBase64 || '', durationSeconds);
   res.json(report);
 });
 
-// 4. Asynchronous TTS Job Creation & Lifecycle
-v1Router.post('/tts/jobs', async (req, res) => {
-  const { text, voiceId, language, settings, idempotencyKey } = req.body;
-  if (!text || !voiceId) {
-    return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'text and voiceId are required.' } });
-  }
-
-  // Idempotency check
-  if (idempotencyKey && asyncJobsLedger.has(idempotencyKey)) {
-    return res.json(asyncJobsLedger.get(idempotencyKey));
-  }
-
-  const jobId = idempotencyKey || `job_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-  const voice = customVoices.find(v => v.id === voiceId) || customVoices[0];
-
-  const jobRecord: AsyncJobRecord = {
-    jobId,
-    type: 'tts',
-    status: 'processing',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    progressPercent: 20,
-    requestPayload: { text, voiceId, language },
-  };
-  asyncJobsLedger.set(jobId, jobRecord);
-
-  // Execute synthesis
+// 4. Asynchronous Job Polling & Cancellation (strictly authenticated & tenant-owned)
+v1Router.get('/jobs/:id', requireAuth, async (req, res) => {
   try {
-    const result = await synthesizer.synthesize(
-      { text, voiceId, language, settings },
-      voice
-    );
-    jobRecord.status = 'completed';
-    jobRecord.progressPercent = 100;
-    jobRecord.updatedAt = new Date().toISOString();
-    jobRecord.result = result;
+    const { id } = req.params;
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
+
+    const ledgerJob = asyncJobsLedger.get(id);
+    const storeJob = (memoryStore.synthesisJobs as any[]).find((j) => j.id === id);
+    const job = (ledgerJob || storeJob) as (AsyncJobRecord & { outputMediaId?: string }) | undefined;
+    if (!job) {
+      return res.status(404).json({
+        error: { code: 'JOB_NOT_FOUND', message: `Job '${id}' not found.` },
+        code: 'JOB_NOT_FOUND',
+      });
+    }
+
+    if (!job.userId || (job.userId !== callerId && !isAdmin)) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'unauthorized_job_access_attempt',
+        resourceId: id,
+        status: 'denied',
+        details: { jobOwnerId: job.userId || null },
+      });
+      return res.status(403).json({
+        error: 'Forbidden: You do not own this job',
+        code: 'FORBIDDEN_NOT_OWNER',
+      });
+    }
+
+    if (job.voiceId && !isVoiceConsentVerifiedActive(job.voiceId)) {
+      const mediaFromJob = scrubJobAudioArtifactsInMemory(
+        job,
+        'Biometric consent for this voice profile has been revoked by the owner.'
+      );
+      const mediaFromStore =
+        storeJob && storeJob !== job
+          ? scrubJobAudioArtifactsInMemory(
+              storeJob,
+              'Biometric consent for this voice profile has been revoked by the owner.'
+            )
+          : undefined;
+      const targetMediaId = mediaFromJob || mediaFromStore;
+      if (targetMediaId) {
+        const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+          mediaId: targetMediaId,
+          requestingUserId: callerId,
+          isAdmin,
+          allowVoiceOwnerCleanup: true,
+          reason: 'consent_revoked',
+          fallbackOwnerId: job.userId,
+          fallbackVoiceId: job.voiceId,
+        });
+        recordSanitizedCleanupFailures(callerId, id, [outcome], {
+          voiceId: job.voiceId,
+          reason: 'consent_revoked',
+        });
+      }
+
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'job_access_blocked_revoked_consent',
+        resourceId: id,
+        status: 'denied',
+        details: { voiceId: job.voiceId },
+      });
+      return res.status(403).json({
+        error: 'Job cancelled: Biometric consent for cloned voice has been revoked by the owner.',
+        code: 'CONSENT_REVOKED',
+        job: {
+          jobId: job.jobId || job.id,
+          status: job.status,
+          voiceId: job.voiceId,
+          error: job.error,
+        },
+      });
+    }
+
+    // Fail closed with 503 if invalidation state is unhealthy rather than mutating a valid uncancelled job
+    PrivateStorageService.assertInvalidationLedgerHealthy();
+
+    if (
+      job.status === 'cancelled' ||
+      (job.outputMediaId && PrivateStorageService.isMediaInvalidated(job.outputMediaId))
+    ) {
+      scrubJobAudioArtifactsInMemory(job, job.error || 'Synthesis job has been cancelled.');
+      if (storeJob && storeJob !== job) {
+        scrubJobAudioArtifactsInMemory(storeJob, storeJob.error || 'Synthesis job has been cancelled.');
+      }
+    }
+
+    res.json(serializeSafeSynthesisJob(job));
   } catch (err: any) {
-    jobRecord.status = 'failed';
-    jobRecord.error = err.message;
-    jobRecord.updatedAt = new Date().toISOString();
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: err.message });
   }
-
-  res.status(202).json(jobRecord);
 });
 
-v1Router.get('/jobs/:id', (req, res) => {
-  const job = asyncJobsLedger.get(req.params.id);
-  if (!job) {
-    return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: `Job '${req.params.id}' not found.` } });
+v1Router.post('/jobs/:id/cancel', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const callerId = req.user!.id;
+    const isAdmin = req.user!.role === 'admin';
+
+    const ledgerJob = asyncJobsLedger.get(id) as (AsyncJobRecord & { outputMediaId?: string }) | undefined;
+    const storeJob = (memoryStore.synthesisJobs as any[]).find((j) => j.id === id);
+    const job = ledgerJob || storeJob;
+
+    if (!job) {
+      return res.status(404).json({
+        error: { code: 'JOB_NOT_FOUND', message: `Job '${id}' not found.` },
+        code: 'JOB_NOT_FOUND',
+      });
+    }
+
+    if (!job.userId || (job.userId !== callerId && !isAdmin)) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'unauthorized_job_cancel_attempt',
+        resourceId: id,
+        status: 'denied',
+        details: { jobOwnerId: job.userId || null },
+      });
+      return res.status(403).json({
+        error: 'Forbidden: You do not own this job',
+        code: 'FORBIDDEN_NOT_OWNER',
+      });
+    }
+
+    const wasAlreadyCancelled = job.status === 'cancelled';
+    const mediaFromLedger = ledgerJob
+      ? scrubJobAudioArtifactsInMemory(ledgerJob, ledgerJob.error || 'Job cancelled by user.')
+      : undefined;
+    const mediaFromStore =
+      storeJob && storeJob !== ledgerJob
+        ? scrubJobAudioArtifactsInMemory(storeJob, storeJob.error || 'Job cancelled by user.')
+        : storeJob === ledgerJob && storeJob
+          ? mediaFromLedger
+          : undefined;
+
+    const targetMediaId = mediaFromLedger || mediaFromStore || pendingCancelledJobMedia.get(id);
+    let cleanupFailed = false;
+    let durableInvalidationEstablished = PrivateStorageService.isInvalidationLedgerHealthy();
+
+    if (targetMediaId) {
+      pendingCancelledJobMedia.set(id, targetMediaId);
+      const outcome = await PrivateStorageService.invalidateAndDeleteMedia({
+        mediaId: targetMediaId,
+        requestingUserId: callerId,
+        isAdmin,
+        reason: 'job_cancelled',
+        fallbackOwnerId: job.userId,
+        fallbackVoiceId: job.voiceId,
+      });
+      const failures = recordSanitizedCleanupFailures(callerId, id, [outcome], {
+        voiceId: job.voiceId,
+        reason: 'job_cancelled',
+      });
+      cleanupFailed = failures > 0;
+      durableInvalidationEstablished =
+        outcome.durableInvalidationEstablished && PrivateStorageService.isInvalidationLedgerHealthy();
+      if (durableInvalidationEstablished) {
+        pendingCancelledJobMedia.delete(id);
+      }
+    }
+
+    if (!durableInvalidationEstablished) {
+      logAuditEvent({
+        userId: callerId,
+        eventType: 'job_cancel_durability_failed',
+        resourceId: id,
+        status: 'failure',
+        details: {
+          alreadyCancelled: wasAlreadyCancelled,
+          artifactInvalidated: Boolean(targetMediaId) || wasAlreadyCancelled,
+          cleanupFailed: true,
+        },
+      });
+      return res.status(503).json({
+        success: false,
+        error:
+          'Job cancellation took effect in memory, but durable storage invalidation could not be persisted.',
+        code: 'STORAGE_UNAVAILABLE',
+        cleanupFailed: true,
+      });
+    }
+
+    logAuditEvent({
+      userId: callerId,
+      eventType: 'job_cancelled',
+      resourceId: id,
+      status: 'success',
+      details: {
+        alreadyCancelled: wasAlreadyCancelled,
+        artifactInvalidated: Boolean(targetMediaId) || wasAlreadyCancelled,
+        cleanupFailed,
+      },
+    });
+
+    res.json({
+      success: true,
+      alreadyCancelled: wasAlreadyCancelled,
+      cleanupFailed,
+      job: serializeSafeSynthesisJob(ledgerJob || storeJob),
+    });
+  } catch (err: any) {
+    if (err?.name === 'StorageUnavailableError') {
+      return res.status(503).json({
+        success: false,
+        error: 'Storage backend is currently unavailable',
+        code: 'STORAGE_UNAVAILABLE',
+      });
+    }
+    res.status(500).json({ error: 'Internal server error' });
   }
-  res.json(job);
 });
 
-v1Router.post('/jobs/:id/cancel', (req, res) => {
-  const job = asyncJobsLedger.get(req.params.id);
-  if (!job) {
-    return res.status(404).json({ error: { code: 'JOB_NOT_FOUND', message: `Job '${req.params.id}' not found.` } });
-  }
-  if (job.status === 'completed' || job.status === 'failed') {
-    return res.status(400).json({ error: { code: 'CANNOT_CANCEL', message: `Job is already ${job.status}.` } });
-  }
-  job.status = 'cancelled';
-  job.updatedAt = new Date().toISOString();
-  res.json({ success: true, job });
+// 5. Projects (authenticated & tenant-scoped)
+v1Router.get('/projects', requireAuth, (req, res) => {
+  const callerId = req.user!.id;
+  const isAdmin = req.user!.role === 'admin';
+  const visible = Array.from(projectsLedger.values()).filter(
+    (p) => p.isPublic === true || isAdmin || (Boolean(p.userId) && p.userId === callerId)
+  );
+  res.json({ projects: visible });
 });
 
-// 5. Projects
-v1Router.get('/projects', (_req, res) => {
-  res.json({ projects: Array.from(projectsLedger.values()) });
-});
-
-v1Router.get('/projects/:id', (req, res) => {
+v1Router.get('/projects/:id', requireAuth, (req, res) => {
   const proj = projectsLedger.get(req.params.id);
   if (!proj) {
-    return res.status(404).json({ error: { code: 'PROJECT_NOT_FOUND', message: `Project '${req.params.id}' not found.` } });
+    return res.status(404).json({
+      error: { code: 'PROJECT_NOT_FOUND', message: `Project '${req.params.id}' not found.` },
+      code: 'PROJECT_NOT_FOUND',
+    });
+  }
+  const callerId = req.user!.id;
+  const isAdmin = req.user!.role === 'admin';
+  if (!proj.isPublic && !isAdmin && proj.userId !== callerId) {
+    return res.status(403).json({
+      error: 'Forbidden: You do not own this project',
+      code: 'FORBIDDEN_NOT_OWNER',
+    });
   }
   res.json(proj);
 });
 
-v1Router.post('/projects', (req, res) => {
+v1Router.post('/projects', requireAuth, (req, res) => {
   const { title, targetLanguages, scenes } = req.body;
-  const id = `proj_${Date.now()}`;
+  const id = `proj_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const newProj = {
     id,
+    userId: req.user!.id,
+    isPublic: false,
     title: title || 'Untitled Voice Project',
     targetLanguages: targetLanguages || ['en'],
     scenes: scenes || 1,
@@ -2485,12 +4059,14 @@ v1Router.post('/projects', (req, res) => {
   res.status(201).json(newProj);
 });
 
-// 6. Visual Studio Motion Graphics Render
-v1Router.post('/visuals/render', (req, res) => {
+// 6. Visual Studio Motion Graphics Render (authenticated & tenant-bound)
+v1Router.post('/visuals/render', requireAuth, (req, res) => {
   const { templateId, audioDurationSec, resolution, format } = req.body;
-  const renderJobId = `render_${Date.now()}`;
+  const renderJobId = `render_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
   const renderRecord: AsyncJobRecord = {
     jobId: renderJobId,
+    id: renderJobId,
+    userId: req.user!.id,
     type: 'visual_render',
     status: 'completed',
     createdAt: new Date().toISOString(),

@@ -14,8 +14,12 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { apiRouter } from './server/routes/api.ts';
-import { config } from './server/config/env.ts';
+import { config, isRestrictedEnvironment, resolveRuntimeEnvironment } from './server/config/env.ts';
 import { assertDatabaseConfigured, checkDatabaseHealth } from './server/db/index.ts';
+import { getAuthSecret } from './server/auth/auth.ts';
+import { PrivateStorageService } from './server/storage/privateStorage.ts';
+import { ConsentVerificationEngine } from './server/engine/audio/consent.ts';
+import { AudioWatermarker } from './server/engine/audio/watermark.ts';
 
 dotenv.config();
 
@@ -23,8 +27,21 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function startServer() {
-  // Fail-closed database configuration check: Aborts startup in staging/production if DATABASE_URL is missing
-  assertDatabaseConfigured(process.env.NODE_ENV);
+  // Fail-closed database and cryptographic secret checks: Aborts startup in staging/production if unconfigured
+  const runtimeEnv = resolveRuntimeEnvironment(process.env.NODE_ENV);
+  assertDatabaseConfigured(runtimeEnv);
+  if (isRestrictedEnvironment(process.env.NODE_ENV)) {
+    getAuthSecret();
+    PrivateStorageService.getSigningSecret();
+    ConsentVerificationEngine.getConsentSecret();
+    AudioWatermarker.getSigningSecret();
+  }
+
+  // Establish durable private-media invalidation & storage state before accepting HTTP traffic
+  PrivateStorageService.init();
+  if (PrivateStorageService.isInvalidationLedgerHealthy()) {
+    await PrivateStorageService.reconcilePendingDeletions().catch(() => {});
+  }
 
   const app = express();
   // Safe proxy trust: Never blindly trust arbitrary client forwarding headers unless explicitly configured
@@ -57,7 +74,7 @@ async function startServer() {
   app.get('/readyz', async (_req, res) => {
     try {
       const health = await checkDatabaseHealth();
-      const isStagingOrProd = process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging';
+      const isStagingOrProd = isRestrictedEnvironment(process.env.NODE_ENV);
 
       if (isStagingOrProd && !health.connected) {
         return res.status(503).json({
@@ -65,6 +82,15 @@ async function startServer() {
           service: 'voiceforge',
           status: 'UNAVAILABLE',
           reason: health.error || 'Database connection required in staging/production.',
+        });
+      }
+
+      if (!PrivateStorageService.isInvalidationLedgerHealthy()) {
+        return res.status(503).json({
+          ready: false,
+          service: 'voiceforge',
+          status: 'UNAVAILABLE',
+          reason: 'Private media invalidation ledger is unavailable.',
         });
       }
 
@@ -102,14 +128,14 @@ async function startServer() {
     res.status(err.status || 500).json({
       error: {
         code: err.code || 'INTERNAL_ERROR',
-        message: config.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+        message: isRestrictedEnvironment(process.env.NODE_ENV) ? 'Internal server error' : err.message,
         timestamp: new Date().toISOString(),
       },
     });
   });
 
-  // Development vs Production serving
-  if (config.NODE_ENV === 'production') {
+  // Development vs Staging/Production serving
+  if (isRestrictedEnvironment(process.env.NODE_ENV)) {
     app.use(express.static(path.resolve(__dirname, 'dist')));
     app.get('*', (_req, res) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));

@@ -30,12 +30,12 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, voiceCo
       try {
         let token = localStorage.getItem('voiceforge_token');
 
-        // If no token exists yet in browser session, bootstrap with creator token
+        // If no token exists yet in browser session, attempt development sandbox bootstrap (empty body; no identity claims)
         if (!token) {
           const bootstrapRes = await fetch('/api/v1/auth/token', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: 'usr_default_creator' }),
+            body: JSON.stringify({}),
           });
           if (bootstrapRes.ok) {
             const data = await bootstrapRes.json();
@@ -91,14 +91,17 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, voiceCo
       const res = await fetch('/api/v1/auth/token', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: 'usr_default_creator' }),
+        body: JSON.stringify({}),
       });
-      if (res.ok) {
-        const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.token) {
         localStorage.setItem('voiceforge_token', data.token);
         setAuthState({ status: 'authenticated', user: data.user });
       } else {
-        setAuthState({ status: 'error', message: 'Failed to sign in' });
+        setAuthState({
+          status: 'error',
+          message: data.error || 'Authentication provider is not configured',
+        });
       }
     } catch (e: any) {
       setAuthState({ status: 'error', message: e.message });

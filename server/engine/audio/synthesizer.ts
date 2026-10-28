@@ -21,6 +21,7 @@ import {
 import { AudioWatermarker } from './watermark.ts';
 import { AudioQualityAnalyzer } from './quality.ts';
 import { ConsentVerificationEngine } from './consent.ts';
+import { isRestrictedEnvironment } from '../../config/env.ts';
 import { TextNormalizer } from '../frontend/normalizer.ts';
 import { Phonemizer } from '../frontend/phonemizer.ts';
 
@@ -297,9 +298,8 @@ export class VoiceForgeSynthesizer {
 
     // 0. Biometric Consent Enforcement for Cloned Voices
     if (voice.category === 'cloned_instant' || voice.category === 'cloned_professional') {
-      const consentRecord = ConsentVerificationEngine.getAuditRecord(voice.id);
-      if (consentRecord && consentRecord.status === 'revoked') {
-        throw new Error(`Synthesis prohibited: Biometric consent for cloned voice "${voice.name}" has been revoked by the owner.`);
+      if (!ConsentVerificationEngine.isConsentActive(voice.id)) {
+        throw new Error(`Synthesis prohibited: Biometric consent for cloned voice "${voice.name}" has been revoked or is unverified.`);
       }
     }
 
@@ -339,7 +339,7 @@ export class VoiceForgeSynthesizer {
         isNeural = true;
         executionMode = 'NEURAL';
       } catch (err: any) {
-        if (process.env.NODE_ENV === 'production' || request.allowDemo === false) {
+        if (isRestrictedEnvironment(process.env.NODE_ENV) || request.allowDemo === false) {
           throw new Error(`Synthesis unavailable: Neural speech engine failed (${err.message}). Demo fallback is disabled.`);
         }
       }
@@ -347,7 +347,7 @@ export class VoiceForgeSynthesizer {
 
     // Explicit fallback to Development Formant Synthesizer
     if (!synthesizedAudio) {
-      if (process.env.NODE_ENV === 'production') {
+      if (isRestrictedEnvironment(process.env.NODE_ENV)) {
         throw new Error('Synthesis unavailable: No production neural engine is ready.');
       }
       const devEngine = this.engines.find((e) => e.id === 'dev_formant')!;
@@ -416,7 +416,7 @@ export class VoiceForgeSynthesizer {
         details: 'OmniVoice neural speech engine online and ready.',
       };
     }
-    if (process.env.NODE_ENV === 'production') {
+    if (isRestrictedEnvironment(process.env.NODE_ENV)) {
       return {
         executionMode: 'UNAVAILABLE',
         isNeural: false,

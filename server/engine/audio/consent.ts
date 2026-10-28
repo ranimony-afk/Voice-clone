@@ -11,6 +11,10 @@
 
 import crypto from 'node:crypto';
 import { AudioQualityAnalyzer } from './quality.ts';
+import { isRestrictedEnvironment } from '../../config/env.ts';
+
+const DEV_FALLBACK_CONSENT_SECRET = 'vf_consent_dev_fallback_secret_99f2a87b1c4e6';
+const LEGACY_STATIC_CONSENT_SECRET = 'vf_consent_sec_prod_99f2a87b1c4e6';
 
 export interface ConsentChallenge {
   challengeId: string;
@@ -58,7 +62,6 @@ export interface ImmutableConsentAuditRecord {
 export class ConsentVerificationEngine {
   private static readonly CHALLENGE_TTL_MS = 5 * 60 * 1000; // 5 minutes
   private static readonly VERIFICATION_THRESHOLD = 0.72; // Strict acoustic cosine similarity threshold
-  private static readonly SERVER_SECRET = process.env.VOICEFORGE_CONSENT_SECRET || 'vf_consent_sec_prod_99f2a87b1c4e6';
 
   // In-memory nonce replay cache (in production backed by DB table consent_records)
   private static consumedNonces: Set<string> = new Set();
@@ -66,9 +69,44 @@ export class ConsentVerificationEngine {
   private static auditRecords: Map<string, ImmutableConsentAuditRecord> = new Map();
 
   /**
+   * Resolves the cryptographic secret for consent challenge signing and audit verification.
+   * Fails closed in restricted environments (`staging`, `production`, and unknown NODE_ENV values)
+   * when `VOICEFORGE_CONSENT_SECRET` is missing, blank, too short, or matches a fallback secret.
+   * Never logs secret values.
+   */
+  public static getConsentSecret(): string {
+    const raw = process.env.VOICEFORGE_CONSENT_SECRET;
+    const trimmed = typeof raw === 'string' ? raw.trim() : '';
+    const restricted = isRestrictedEnvironment(process.env.NODE_ENV);
+
+    if (trimmed.length === 0) {
+      if (restricted) {
+        throw new Error(
+          'FATAL SECURITY CONFIGURATION: VOICEFORGE_CONSENT_SECRET must be explicitly configured in staging and production.'
+        );
+      }
+      return DEV_FALLBACK_CONSENT_SECRET;
+    }
+
+    if (
+      restricted &&
+      (trimmed.length < 16 ||
+        trimmed === DEV_FALLBACK_CONSENT_SECRET ||
+        trimmed === LEGACY_STATIC_CONSENT_SECRET)
+    ) {
+      throw new Error(
+        'FATAL SECURITY CONFIGURATION: VOICEFORGE_CONSENT_SECRET is invalid or uses a non-production fallback secret in staging/production.'
+      );
+    }
+
+    return trimmed;
+  }
+
+  /**
    * Generates a fresh, signed, expiring challenge for the user to speak
    */
   public static issueChallenge(userId: string, voiceName: string, customTtlMs?: number): ConsentChallenge {
+    const secret = this.getConsentSecret();
     const cleanUserId = userId?.trim() || 'anonymous_user';
     const cleanVoiceName = voiceName?.trim() || 'Custom Voice';
     const challengeId = `ch_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
@@ -81,7 +119,7 @@ export class ConsentVerificationEngine {
     const requiredPhrase = `I, authorizing ${cleanVoiceName}, explicitly grant VoiceForge permission to clone my voice for my account on ${new Date(issuedAt).toISOString().split('T')[0]} using security code ${shortCode}.`;
 
     const payload = `${challengeId}:${nonce}:${cleanUserId}:${cleanVoiceName}:${issuedAt}:${expiresAt}`;
-    const signature = crypto.createHmac('sha256', this.SERVER_SECRET).update(payload).digest('hex');
+    const signature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
 
     return {
       challengeId,
@@ -104,6 +142,7 @@ export class ConsentVerificationEngine {
    * 5. Issues immutable signed audit record
    */
   public static verifyEnrollment(input: ConsentVerificationInput): ConsentVerificationOutcome {
+    const secret = this.getConsentSecret();
     const { challenge, voiceName, referenceAudio, consentAudio, userId } = input;
 
     // --- GATE 1: Challenge Signature & Expiration ---
@@ -117,11 +156,21 @@ export class ConsentVerificationEngine {
       };
     }
 
-    // Verify HMAC signature
+    // Verify HMAC signature in constant time
     const expectedPayload = `${challenge.challengeId}:${challenge.nonce}:${challenge.userId}:${challenge.voiceName}:${challenge.issuedAt}:${challenge.expiresAt}`;
-    const expectedSignature = crypto.createHmac('sha256', this.SERVER_SECRET).update(expectedPayload).digest('hex');
+    const expectedSignature = crypto.createHmac('sha256', secret).update(expectedPayload).digest('hex');
 
-    if (challenge.signature !== expectedSignature) {
+    let signatureValid = false;
+    try {
+      const providedBuf = Buffer.from(challenge.signature);
+      const expectedBuf = Buffer.from(expectedSignature);
+      signatureValid =
+        providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf);
+    } catch {
+      signatureValid = false;
+    }
+
+    if (!signatureValid) {
       return {
         verified: false,
         errorCode: 'CHALLENGE_TAMPERED',
@@ -227,9 +276,10 @@ export class ConsentVerificationEngine {
     const voiceId = `voice_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const recordId = `rec_${Date.now()}_${crypto.randomBytes(6).toString('hex')}`;
     const verifiedAt = new Date().toISOString();
+    const normalizedScore = parseFloat(similarity.toFixed(3));
 
-    const auditPayload = `${recordId}:${userId}:${voiceId}:${challenge.challengeId}:${refHash}:${consentHash}:${similarity.toFixed(4)}:${verifiedAt}`;
-    const auditSignature = crypto.createHmac('sha256', this.SERVER_SECRET).update(auditPayload).digest('hex');
+    const auditPayload = `${recordId}:${userId}:${voiceId}:${challenge.challengeId}:${refHash}:${consentHash}:${normalizedScore.toFixed(3)}:${verifiedAt}`;
+    const auditSignature = crypto.createHmac('sha256', secret).update(auditPayload).digest('hex');
 
     const auditRecord: ImmutableConsentAuditRecord = {
       recordId,
@@ -238,7 +288,7 @@ export class ConsentVerificationEngine {
       challengeId: challenge.challengeId,
       referenceAudioHash: refHash,
       consentAudioHash: consentHash,
-      similarityScore: parseFloat(similarity.toFixed(3)),
+      similarityScore: normalizedScore,
       status: 'active',
       verifiedAt,
       auditSignature,
@@ -248,7 +298,7 @@ export class ConsentVerificationEngine {
 
     return {
       verified: true,
-      similarityScore: parseFloat(similarity.toFixed(3)),
+      similarityScore: normalizedScore,
       threshold: this.VERIFICATION_THRESHOLD,
       voiceId,
       auditRecord,
@@ -257,40 +307,79 @@ export class ConsentVerificationEngine {
 
   /**
    * Revokes consent for a voice profile. Immediate fail-closed for any future synthesis.
+   * Admin override requires an explicit server-verified `options.isAdmin === true` flag;
+   * magic userId strings (e.g. 'admin', 'usr_admin_root') never grant administrative authority.
    */
-  public static revokeConsent(voiceId: string, userId: string): boolean {
+  public static revokeConsent(
+    voiceId: string,
+    actorUserId: string,
+    options?: { isAdmin?: boolean; recordRevocationMarker?: boolean; resourceOwnerId?: string }
+  ): boolean {
+    if (!voiceId || typeof voiceId !== 'string' || !actorUserId || typeof actorUserId !== 'string') {
+      return false;
+    }
+
+    const isAdmin = options?.isAdmin === true;
     let record = this.auditRecords.get(voiceId);
+
     if (!record) {
+      if (options?.recordRevocationMarker !== true) {
+        return false;
+      }
+      const markerOwnerId =
+        typeof options?.resourceOwnerId === 'string' && options.resourceOwnerId.length > 0
+          ? options.resourceOwnerId
+          : actorUserId;
+      if (markerOwnerId !== actorUserId && !isAdmin) {
+        return false;
+      }
+      const nowIso = new Date().toISOString();
       record = {
         recordId: `rec_rev_${Date.now()}`,
-        userId,
+        userId: markerOwnerId,
         voiceId,
         challengeId: 'revoked',
         referenceAudioHash: '',
         consentAudioHash: '',
         similarityScore: 0,
         status: 'revoked',
-        verifiedAt: new Date().toISOString(),
-        revokedAt: new Date().toISOString(),
+        verifiedAt: nowIso,
+        revokedAt: nowIso,
         auditSignature: 'revoked',
       };
       this.auditRecords.set(voiceId, record);
       return true;
     }
-    if (record.userId !== userId && userId !== 'admin' && userId !== 'usr_admin_root') return false;
+
+    if (record.userId !== actorUserId && !isAdmin) {
+      return false;
+    }
 
     record.status = 'revoked';
-    record.revokedAt = new Date().toISOString();
+    record.revokedAt = record.revokedAt || new Date().toISOString();
     return true;
   }
 
   /**
-   * Checks if consent is active and unrevoked for a voice profile
+   * Checks if consent is active, unrevoked, and cryptographically valid under the active environment secret.
+   * Fails closed (`false`) if consent was revoked, if `VOICEFORGE_CONSENT_SECRET` is unconfigured/invalid in
+   * a restricted environment, or if a dev/test-enrolled record is evaluated in `staging` or `production`.
    */
   public static isConsentActive(voiceId: string): boolean {
     const record = this.auditRecords.get(voiceId);
     if (!record) return true; // Premade system voices have active consent by default
-    return record.status === 'active';
+    if (record.status !== 'active') return false;
+
+    try {
+      const secret = this.getConsentSecret();
+      const expectedPayload = `${record.recordId}:${record.userId}:${record.voiceId}:${record.challengeId}:${record.referenceAudioHash}:${record.consentAudioHash}:${record.similarityScore.toFixed(3)}:${record.verifiedAt}`;
+      const expectedSig = crypto.createHmac('sha256', secret).update(expectedPayload).digest('hex');
+      const providedBuf = Buffer.from(record.auditSignature || '');
+      const expectedBuf = Buffer.from(expectedSig);
+      return providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf);
+    } catch {
+      return false;
+    }
   }
 
   /**

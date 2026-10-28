@@ -159,12 +159,15 @@ export const VoiceCloningLabView: React.FC<VoiceCloningLabViewProps> = ({
     setFetchingChallenge(true);
     setConsentError(null);
     try {
+      const token = localStorage.getItem('voiceforge_token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
       const res = await fetch('/api/voices/clone/challenge', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           voiceName: voiceName.trim() || 'Custom Voice',
-          userId: 'user_active',
         }),
       });
       const data = await res.json();
@@ -385,15 +388,18 @@ export const VoiceCloningLabView: React.FC<VoiceCloningLabViewProps> = ({
     setConsentError(null);
 
     try {
+      const token = localStorage.getItem('voiceforge_token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
       const consentRes = await fetch('/api/voices/clone/verify-consent', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           challenge,
           voiceName: voiceName.trim() || 'Custom Voice',
           referenceAudioBase64: audioBase64,
           consentAudioBase64,
-          userId: 'user_active',
           gender: selectedGender,
           primaryLanguage,
         }),
@@ -430,17 +436,22 @@ export const VoiceCloningLabView: React.FC<VoiceCloningLabViewProps> = ({
     if (!clonedVoice) return;
     setIsRevoking(true);
     try {
+      const token = localStorage.getItem('voiceforge_token');
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+
       const res = await fetch('/api/voices/clone/revoke-consent', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           voiceId: clonedVoice.id,
-          userId: 'user_active',
         }),
       });
       const data = await res.json();
-      if (data.success) {
+      if (res.ok && data.success) {
         setRevocationSuccess(data.message);
+      } else {
+        setConsentError(data.error || 'Failed to revoke consent');
       }
     } catch (err) {
       console.error('Revocation error:', err);
