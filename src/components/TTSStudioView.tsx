@@ -33,6 +33,13 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [audioDuration, setAudioDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
+  const [engineStatus, setEngineStatus] = useState<{
+    executionMode: 'NEURAL' | 'DEMO' | 'UNAVAILABLE';
+    isNeural: boolean;
+    primaryEngine: string;
+    details: string;
+  } | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [metaInfo, setMetaInfo] = useState<{
     latencyMs: number;
     credits: number;
@@ -40,6 +47,7 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
     phonemes: string;
     engineUsed?: string;
     isNeural?: boolean;
+    executionMode?: 'NEURAL' | 'DEMO' | 'UNAVAILABLE';
   } | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -50,6 +58,13 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
   const sourceRef = useRef<MediaElementAudioSourceNode | null>(null);
 
   const selectedVoice = voices.find(v => v.id === selectedVoiceId) || voices[0];
+
+  useEffect(() => {
+    fetch('/api/engine/status')
+      .then((res) => res.json())
+      .then((data) => setEngineStatus(data))
+      .catch((err) => console.warn('Could not query engine status:', err));
+  }, []);
 
   useEffect(() => {
     if (selectedVoice) {
@@ -147,6 +162,7 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
     if (!text.trim()) return;
     setGenerating(true);
     setIsPlaying(false);
+    setErrorMessage(null);
 
     try {
       const res = await fetch('/api/tts/synthesize', {
@@ -158,8 +174,14 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
           language: selectedVoice.primaryLanguage,
           settings,
           instruct: instruct.trim() || undefined,
+          allowDemo: true,
         }),
       });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ error: 'Synthesis failed' }));
+        throw new Error(errData.error || `Synthesis failed (HTTP ${res.status})`);
+      }
 
       const data = await res.json();
       if (data.audioBase64) {
@@ -183,6 +205,7 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
           phonemes: data.phonemes,
           engineUsed: data.engineUsed,
           isNeural: data.isNeural,
+          executionMode: data.executionMode,
         });
 
         // Autoplay
@@ -197,8 +220,9 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
           }
         }, 100);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Synthesis failed:', err);
+      setErrorMessage(err.message || 'Speech synthesis failed.');
     } finally {
       setGenerating(false);
     }
@@ -294,6 +318,47 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
           })}
         </div>
       </div>
+
+      {/* Real-time Truthful Engine Execution Mode Pill */}
+      {engineStatus && (
+        <div className={`p-3.5 rounded-xl border flex flex-col sm:flex-row items-start sm:items-center justify-between gap-2 text-xs ${
+          engineStatus.executionMode === 'NEURAL'
+            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+            : engineStatus.executionMode === 'DEMO'
+            ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+            : 'bg-red-500/10 border-red-500/30 text-red-300'
+        }`}>
+          <div className="flex items-center gap-2.5">
+            <Cpu className="w-4 h-4 shrink-0" />
+            <div>
+              <span className="font-bold tracking-wide uppercase">
+                Mode: {engineStatus.executionMode === 'NEURAL' ? 'Neural Inference' : engineStatus.executionMode === 'DEMO' ? 'Development Demo Harmonic' : 'Unavailable'}
+              </span>
+              <span className="mx-2 text-slate-500 hidden sm:inline">•</span>
+              <span className="text-slate-300">{engineStatus.details}</span>
+            </div>
+          </div>
+          <span className="font-mono-code text-[11px] px-2 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300">
+            Engine: {engineStatus.primaryEngine}
+          </span>
+        </div>
+      )}
+
+      {/* Synthesis Error Alert */}
+      {errorMessage && (
+        <div className="p-3.5 rounded-xl bg-red-950/40 border border-red-500/40 text-red-300 text-xs flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="font-bold">Synthesis Error:</span>
+            <span>{errorMessage}</span>
+          </div>
+          <button
+            onClick={() => setErrorMessage(null)}
+            className="text-[11px] px-2 py-0.5 rounded bg-red-900/60 hover:bg-red-800 text-white"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Main Studio Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -441,13 +506,13 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
               <div className="flex items-center justify-between text-xs text-slate-400">
                 <div className="flex items-center gap-2">
                   <span className="font-semibold text-white">Master Audio Output</span>
-                  {metaInfo?.isNeural ? (
+                  {metaInfo?.executionMode === 'NEURAL' || metaInfo?.isNeural ? (
                     <span className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[10px] font-semibold">
-                      ⚡ Neural OmniVoice
+                      ⚡ Genuine Neural OmniVoice Output
                     </span>
                   ) : (
-                    <span className="px-2 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-300 text-[10px] font-mono-code">
-                      Harmonic Synthesis Engine
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-amber-300 text-[10px] font-semibold">
+                      🧪 Development Formant Audio (Harmonic Demo Mode)
                     </span>
                   )}
                 </div>

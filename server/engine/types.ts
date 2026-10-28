@@ -32,6 +32,8 @@ export interface VoiceProfile {
   avatarUrl?: string;
   instruct?: string;       // Voice design prompt (e.g. 'female, low pitch, british accent')
   voicePromptId?: string;  // OmniVoice serialized voice clone prompt ID
+  userId?: string;         // Owner user ID (for cloned or custom voices)
+  isPublic?: boolean;      // Whether voice is publicly accessible or private to owner
 }
 
 export interface AudioQualityReport {
@@ -57,6 +59,8 @@ export interface PhonemizationResult {
   linguisticNotes: string[];
 }
 
+export type ExecutionMode = 'NEURAL' | 'DEMO' | 'UNAVAILABLE';
+
 export interface SynthesisRequest {
   text: string;
   voiceId: string;
@@ -66,6 +70,7 @@ export interface SynthesisRequest {
   sampleRate?: 22050 | 24000 | 44100;
   instruct?: string;
   voicePromptId?: string;
+  allowDemo?: boolean;
 }
 
 export interface SynthesisResponse {
@@ -80,6 +85,7 @@ export interface SynthesisResponse {
   phonemes: string;
   engineUsed?: string;
   isNeural?: boolean;
+  executionMode?: ExecutionMode;
   provenanceHash?: string;
 }
 

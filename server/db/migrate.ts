@@ -15,15 +15,17 @@ export async function runMigrations(connectionString?: string): Promise<{ succes
     };
   }
 
+  const isLocal = dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1') || dbUrl.includes('sslmode=disable');
   const pool = new Pool({
     connectionString: dbUrl,
-    ssl: dbUrl.includes('localhost') ? false : { rejectUnauthorized: false },
+    ssl: isLocal ? false : { rejectUnauthorized: false },
     connectionTimeoutMillis: 5000,
   });
 
-  const client = await pool.connect();
+  let client: pg.PoolClient | null = null;
 
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
 
     // Extension
@@ -180,11 +182,105 @@ export async function runMigrations(connectionString?: string): Promise<{ succes
       );
     `);
 
+    // Phase 3A: Consent Records table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS consent_records (
+        id VARCHAR(128) PRIMARY KEY,
+        user_id VARCHAR(128) NOT NULL,
+        voice_id VARCHAR(128) NOT NULL,
+        voice_name VARCHAR(120) NOT NULL,
+        challenge_id VARCHAR(128) NOT NULL,
+        required_phrase TEXT NOT NULL,
+        reference_audio_hash VARCHAR(64) NOT NULL,
+        consent_audio_hash VARCHAR(64) NOT NULL,
+        similarity_score REAL NOT NULL,
+        threshold REAL DEFAULT 0.72 NOT NULL,
+        status VARCHAR(30) DEFAULT 'active' NOT NULL,
+        verified_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+        revoked_at TIMESTAMPTZ,
+        audit_signature TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_consent_records_user ON consent_records(user_id);
+      CREATE INDEX IF NOT EXISTS idx_consent_records_voice ON consent_records(voice_id);
+    `);
+
+    // Phase 3A: Private Media table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS private_media (
+        id VARCHAR(128) PRIMARY KEY,
+        user_id VARCHAR(128) NOT NULL,
+        media_type VARCHAR(50) NOT NULL,
+        storage_key VARCHAR(255) NOT NULL,
+        filename VARCHAR(255) NOT NULL,
+        mime_type VARCHAR(100) NOT NULL,
+        byte_size INT NOT NULL,
+        sha256_hash VARCHAR(64) NOT NULL,
+        audio_format VARCHAR(20) NOT NULL,
+        is_encrypted BOOLEAN DEFAULT FALSE NOT NULL,
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_private_media_user ON private_media(user_id);
+    `);
+
+    // Phase 3A: Synthesis Jobs table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS synthesis_jobs (
+        id VARCHAR(128) PRIMARY KEY,
+        user_id VARCHAR(128) NOT NULL,
+        voice_id VARCHAR(128) NOT NULL,
+        status VARCHAR(30) DEFAULT 'pending' NOT NULL,
+        execution_mode VARCHAR(20) NOT NULL,
+        input_text TEXT NOT NULL,
+        language VARCHAR(10) NOT NULL,
+        output_media_id VARCHAR(128),
+        output_signed_url TEXT,
+        duration_seconds REAL,
+        character_count INT,
+        credits_charged INT DEFAULT 0 NOT NULL,
+        watermark_signature VARCHAR(128),
+        error_message TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+        completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_synthesis_jobs_user ON synthesis_jobs(user_id);
+    `);
+
+    // Phase 3A: Audit Events table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id VARCHAR(128) PRIMARY KEY,
+        user_id VARCHAR(128) NOT NULL,
+        event_type VARCHAR(60) NOT NULL,
+        resource_id VARCHAR(128),
+        ip_address VARCHAR(64),
+        user_agent TEXT,
+        status VARCHAR(30) NOT NULL,
+        details JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_audit_events_user ON audit_events(user_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_events_type ON audit_events(event_type);
+    `);
+
+    // Phase 3B: Revoked Tokens table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS revoked_tokens (
+        token_hash VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(128),
+        reason VARCHAR(255),
+        revoked_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+        expires_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS idx_revoked_tokens_user ON revoked_tokens(user_id);
+    `);
+
     await client.query('COMMIT');
 
     return {
       success: true,
-      message: 'PostgreSQL schema migrations applied successfully with all tables and indexes.',
+      message: 'PostgreSQL schema migrations applied successfully with all tables and indexes including Phase 3A security tables and Phase 3B durable revocation table.',
       tablesCreated: [
         'users',
         'api_keys',
@@ -194,16 +290,31 @@ export async function runMigrations(connectionString?: string): Promise<{ succes
         'transcription_translation_jobs',
         'dubbing_jobs',
         'usage_events',
+        'consent_records',
+        'private_media',
+        'synthesis_jobs',
+        'audit_events',
+        'revoked_tokens',
       ],
     };
   } catch (err: any) {
-    await client.query('ROLLBACK');
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {}
+    }
     return {
       success: false,
       message: `Migration failed: ${err.message}`,
     };
   } finally {
-    client.release();
-    await pool.end();
+    if (client) {
+      try {
+        client.release();
+      } catch {}
+    }
+    try {
+      await pool.end();
+    } catch {}
   }
 }

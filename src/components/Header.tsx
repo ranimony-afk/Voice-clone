@@ -1,5 +1,5 @@
-import React from 'react';
-import { Volume2, Sparkles, Activity, ShieldCheck, Zap, Music, Image as ImageIcon, Film, Radio, Layers, CreditCard, Languages, Scissors } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import { Volume2, Sparkles, Activity, ShieldCheck, Zap, Music, Image as ImageIcon, Film, Radio, Layers, CreditCard, Languages, Scissors, Loader2, UserX, AlertCircle } from 'lucide-react';
 
 interface HeaderProps {
   activeTab: string;
@@ -7,7 +7,119 @@ interface HeaderProps {
   voiceCount: number;
 }
 
+interface UserPrincipal {
+  id: string;
+  fullName: string;
+  email: string;
+  role: string;
+}
+
+type AuthState =
+  | { status: 'loading' }
+  | { status: 'authenticated'; user: UserPrincipal }
+  | { status: 'signed-out' }
+  | { status: 'error'; message: string };
+
 export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, voiceCount }) => {
+  const [authState, setAuthState] = useState<AuthState>({ status: 'loading' });
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function loadPrincipal() {
+      try {
+        let token = localStorage.getItem('voiceforge_token');
+
+        // If no token exists yet in browser session, bootstrap with creator token
+        if (!token) {
+          const bootstrapRes = await fetch('/api/v1/auth/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: 'usr_default_creator' }),
+          });
+          if (bootstrapRes.ok) {
+            const data = await bootstrapRes.json();
+            if (data.token && typeof data.token === 'string') {
+              token = data.token;
+              localStorage.setItem('voiceforge_token', data.token);
+            }
+          }
+        }
+
+        if (!token) {
+          if (isMounted) setAuthState({ status: 'signed-out' });
+          return;
+        }
+
+        const meRes = await fetch('/api/v1/auth/me', {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        if (meRes.ok) {
+          const data = await meRes.json();
+          if (isMounted) {
+            setAuthState({
+              status: 'authenticated',
+              user: data.user,
+            });
+          }
+        } else if (meRes.status === 401 || meRes.status === 403) {
+          localStorage.removeItem('voiceforge_token');
+          if (isMounted) setAuthState({ status: 'signed-out' });
+        } else {
+          if (isMounted) {
+            setAuthState({ status: 'error', message: `Auth error: HTTP ${meRes.status}` });
+          }
+        }
+      } catch (err: any) {
+        if (isMounted) {
+          setAuthState({ status: 'error', message: err.message || 'Authentication check failed' });
+        }
+      }
+    }
+
+    loadPrincipal();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleSignIn = async () => {
+    setAuthState({ status: 'loading' });
+    try {
+      const res = await fetch('/api/v1/auth/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'usr_default_creator' }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        localStorage.setItem('voiceforge_token', data.token);
+        setAuthState({ status: 'authenticated', user: data.user });
+      } else {
+        setAuthState({ status: 'error', message: 'Failed to sign in' });
+      }
+    } catch (e: any) {
+      setAuthState({ status: 'error', message: e.message });
+    }
+  };
+
+  const handleSignOut = async () => {
+    const token = localStorage.getItem('voiceforge_token');
+    if (token) {
+      fetch('/api/v1/auth/revoke', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ token }),
+      }).catch(() => {});
+    }
+    localStorage.removeItem('voiceforge_token');
+    setAuthState({ status: 'signed-out' });
+  };
   return (
     <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md sticky top-0 z-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -45,6 +157,61 @@ export const Header: React.FC<HeaderProps> = ({ activeTab, setActiveTab, voiceCo
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
               <span>Online ({voiceCount} voices)</span>
             </div>
+
+            {authState.status === 'loading' && (
+              <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700/60 text-slate-400">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                <span>Authenticating...</span>
+              </div>
+            )}
+
+            {authState.status === 'authenticated' && (
+              <div
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/30 text-indigo-300 font-medium"
+                title={`Authenticated principal: ${authState.user.email} (${authState.user.id})`}
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
+                <span>
+                  {authState.user.fullName}{' '}
+                  <span className="text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded bg-indigo-600/30 text-indigo-300 border border-indigo-400/20">
+                    {authState.user.role}
+                  </span>
+                </span>
+                <button
+                  onClick={handleSignOut}
+                  className="ml-1 text-slate-500 hover:text-slate-300 transition-colors cursor-pointer"
+                  title="Sign Out Session"
+                >
+                  <UserX className="w-3 h-3" />
+                </button>
+              </div>
+            )}
+
+            {authState.status === 'signed-out' && (
+              <button
+                onClick={handleSignIn}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 transition-all cursor-pointer"
+                title="Click to sign in with session token"
+              >
+                <UserX className="w-3.5 h-3.5 text-slate-400" />
+                <span>Signed Out</span>
+                <span className="text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded bg-indigo-600/40 text-indigo-200">
+                  Sign In
+                </span>
+              </button>
+            )}
+
+            {authState.status === 'error' && (
+              <button
+                onClick={handleSignIn}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs cursor-pointer"
+                title={authState.message}
+              >
+                <AlertCircle className="w-3.5 h-3.5 text-rose-400" />
+                <span>Auth Error</span>
+                <span className="text-[10px] underline ml-1">Retry</span>
+              </button>
+            )}
           </div>
         </div>
 

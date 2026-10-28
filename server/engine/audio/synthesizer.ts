@@ -321,8 +321,9 @@ export class VoiceForgeSynthesizer {
     let synthesizedAudio: Buffer | null = null;
     let selectedEngineId = 'dev_formant';
     let isNeural = false;
+    let executionMode: 'NEURAL' | 'DEMO' | 'UNAVAILABLE' = 'DEMO';
 
-    // Attempt primary neural engine if available and requested
+    // Attempt primary neural engine if available
     const neuralEngine = this.engines.find((e) => e.isNeural);
     if (neuralEngine && (await neuralEngine.isAvailable())) {
       try {
@@ -336,13 +337,19 @@ export class VoiceForgeSynthesizer {
         synthesizedAudio = res.audioBuffer;
         selectedEngineId = res.engineUsed;
         isNeural = true;
-      } catch {
-        // Fall back to development engine gracefully
+        executionMode = 'NEURAL';
+      } catch (err: any) {
+        if (process.env.NODE_ENV === 'production' || request.allowDemo === false) {
+          throw new Error(`Synthesis unavailable: Neural speech engine failed (${err.message}). Demo fallback is disabled.`);
+        }
       }
     }
 
-    // Fallback to Development Formant Synthesizer
+    // Explicit fallback to Development Formant Synthesizer
     if (!synthesizedAudio) {
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('Synthesis unavailable: No production neural engine is ready.');
+      }
       const devEngine = this.engines.find((e) => e.id === 'dev_formant')!;
       const res = await devEngine.synthesize({
         text: request.text,
@@ -354,6 +361,7 @@ export class VoiceForgeSynthesizer {
       synthesizedAudio = res.audioBuffer;
       selectedEngineId = res.engineUsed;
       isNeural = false;
+      executionMode = 'DEMO';
     }
 
     const durationSeconds = Math.max(1.0, synthesizedAudio.length / (sampleRate * 2));
@@ -386,6 +394,41 @@ export class VoiceForgeSynthesizer {
       phonemes: g2p.ipa,
       engineUsed: selectedEngineId,
       isNeural,
+      executionMode,
+    };
+  }
+
+  /**
+   * Truthfully queries and reports runtime engine execution status
+   */
+  public async getExecutionStatus(): Promise<{
+    executionMode: 'NEURAL' | 'DEMO' | 'UNAVAILABLE';
+    isNeural: boolean;
+    primaryEngine: string;
+    details: string;
+  }> {
+    const neural = this.engines.find((e) => e.isNeural);
+    if (neural && (await neural.isAvailable())) {
+      return {
+        executionMode: 'NEURAL',
+        isNeural: true,
+        primaryEngine: neural.name,
+        details: 'OmniVoice neural speech engine online and ready.',
+      };
+    }
+    if (process.env.NODE_ENV === 'production') {
+      return {
+        executionMode: 'UNAVAILABLE',
+        isNeural: false,
+        primaryEngine: 'k2-fsa/OmniVoice-v0.2.1',
+        details: 'Neural engine unavailable: weights offline. Demo harmonic fallback disabled in production.',
+      };
+    }
+    return {
+      executionMode: 'DEMO',
+      isNeural: false,
+      primaryEngine: 'development_formant_fallback',
+      details: 'Operating in development harmonic demonstration mode.',
     };
   }
 

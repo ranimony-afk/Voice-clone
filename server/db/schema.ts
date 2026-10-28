@@ -158,3 +158,81 @@ export const usageEvents = pgTable('usage_events', {
   metadata: jsonb('metadata'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+// Consent Records Table (Biometric Voice Verification & Ownership)
+export const consentRecords = pgTable('consent_records', {
+  id: varchar('id', { length: 128 }).primaryKey(),
+  userId: varchar('user_id', { length: 128 }).notNull(),
+  voiceId: varchar('voice_id', { length: 128 }).notNull(),
+  voiceName: varchar('voice_name', { length: 120 }).notNull(),
+  challengeId: varchar('challenge_id', { length: 128 }).notNull(),
+  requiredPhrase: text('required_phrase').notNull(),
+  referenceAudioHash: varchar('reference_audio_hash', { length: 64 }).notNull(),
+  consentAudioHash: varchar('consent_audio_hash', { length: 64 }).notNull(),
+  similarityScore: real('similarity_score').notNull(),
+  threshold: real('threshold').default(0.72).notNull(),
+  status: varchar('status', { length: 30 }).default('active').notNull(), // 'active' | 'revoked'
+  verifiedAt: timestamp('verified_at', { withTimezone: true }).defaultNow().notNull(),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  auditSignature: text('audit_signature').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// Private Media Table (Encrypted/Private Storage Metadata & Magic-Byte Validated Audio)
+export const privateMedia = pgTable('private_media', {
+  id: varchar('id', { length: 128 }).primaryKey(),
+  userId: varchar('user_id', { length: 128 }).notNull(),
+  mediaType: varchar('media_type', { length: 50 }).notNull(), // 'reference_audio' | 'consent_audio' | 'tts_output' | 'stem'
+  storageKey: varchar('storage_key', { length: 255 }).notNull(),
+  filename: varchar('filename', { length: 255 }).notNull(),
+  mimeType: varchar('mime_type', { length: 100 }).notNull(),
+  byteSize: integer('byte_size').notNull(),
+  sha256Hash: varchar('sha256_hash', { length: 64 }).notNull(),
+  audioFormat: varchar('audio_format', { length: 20 }).notNull(), // 'wav' | 'mp3' | 'webm' | 'ogg' | 'flac'
+  isEncrypted: boolean('is_encrypted').default(false).notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// Synthesis Jobs Table (Asynchronous and Stateful Synthesis with Ownership & Execution Mode)
+export const synthesisJobs = pgTable('synthesis_jobs', {
+  id: varchar('id', { length: 128 }).primaryKey(),
+  userId: varchar('user_id', { length: 128 }).notNull(),
+  voiceId: varchar('voice_id', { length: 128 }).notNull(),
+  status: varchar('status', { length: 30 }).default('pending').notNull(), // 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled'
+  executionMode: varchar('execution_mode', { length: 20 }).notNull(), // 'NEURAL' | 'DEMO' | 'UNAVAILABLE'
+  inputText: text('input_text').notNull(),
+  language: varchar('language', { length: 10 }).notNull(),
+  outputMediaId: varchar('output_media_id', { length: 128 }),
+  outputSignedUrl: text('output_signed_url'),
+  durationSeconds: real('duration_seconds'),
+  characterCount: integer('character_count'),
+  creditsCharged: integer('credits_charged').default(0).notNull(),
+  watermarkSignature: varchar('watermark_signature', { length: 128 }),
+  errorMessage: text('error_message'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  completedAt: timestamp('completed_at', { withTimezone: true }),
+});
+
+// Audit Events Table (Tamper-Evident Security Log for Sensitive Operations)
+export const auditEvents = pgTable('audit_events', {
+  id: varchar('id', { length: 128 }).primaryKey(),
+  userId: varchar('user_id', { length: 128 }).notNull(),
+  eventType: varchar('event_type', { length: 60 }).notNull(), // 'consent_enrolled' | 'consent_revoked' | 'voice_created' | 'voice_deleted' | 'synthesis_dispatched' | 'media_accessed' | 'unauthorized_access_attempt'
+  resourceId: varchar('resource_id', { length: 128 }),
+  ipAddress: varchar('ip_address', { length: 64 }),
+  userAgent: text('user_agent'),
+  status: varchar('status', { length: 30 }).notNull(), // 'success' | 'failure' | 'denied'
+  details: jsonb('details'),
+  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
+// Revoked Tokens Table (Durable Token Revocation Registry storing SHA-256 hashes only)
+export const revokedTokens = pgTable('revoked_tokens', {
+  tokenHash: varchar('token_hash', { length: 64 }).primaryKey(),
+  userId: varchar('user_id', { length: 128 }),
+  reason: varchar('reason', { length: 255 }),
+  revokedAt: timestamp('revoked_at', { withTimezone: true }).defaultNow().notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+});
+

@@ -15,6 +15,7 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Modality } from '@google/genai';
 import { apiRouter } from './server/routes/api.ts';
 import { config } from './server/config/env.ts';
+import { assertDatabaseConfigured, checkDatabaseHealth } from './server/db/index.ts';
 
 dotenv.config();
 
@@ -22,7 +23,14 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 async function startServer() {
+  // Fail-closed database configuration check: Aborts startup in staging/production if DATABASE_URL is missing
+  assertDatabaseConfigured(process.env.NODE_ENV);
+
   const app = express();
+  // Safe proxy trust: Never blindly trust arbitrary client forwarding headers unless explicitly configured
+  const trustProxyConfig = process.env.VOICEFORGE_TRUST_PROXY === 'true';
+  app.set('trust proxy', trustProxyConfig);
+
   // Per environment constraints: Dev server must run on port 3000
   const PORT = 3000;
 
@@ -46,8 +54,28 @@ async function startServer() {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  app.get('/readyz', (_req, res) => {
-    res.status(200).json({ ready: true, service: 'voiceforge' });
+  app.get('/readyz', async (_req, res) => {
+    try {
+      const health = await checkDatabaseHealth();
+      const isStagingOrProd = process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'staging';
+
+      if (isStagingOrProd && !health.connected) {
+        return res.status(503).json({
+          ready: false,
+          service: 'voiceforge',
+          status: 'UNAVAILABLE',
+          reason: health.error || 'Database connection required in staging/production.',
+        });
+      }
+
+      res.status(200).json({
+        ready: true,
+        service: 'voiceforge',
+        engine: health.engine,
+      });
+    } catch (err: any) {
+      res.status(503).json({ ready: false, error: err.message });
+    }
   });
 
   // Body parser for JSON and audio/video buffers

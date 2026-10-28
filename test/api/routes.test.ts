@@ -94,6 +94,17 @@ describe('Express API Integration Tests', () => {
     assert.equal(data.format, 'wav');
     assert.ok(data.watermarkSignature.length === 64);
     assert.ok(data.engineUsed);
+    assert.ok(['NEURAL', 'DEMO', 'UNAVAILABLE'].includes(data.executionMode));
+  });
+
+  test('GET /api/engine/status returns truthful execution mode and engine identity', async () => {
+    const res = await fetch(`${baseUrl}/api/engine/status`);
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    assert.ok(['NEURAL', 'DEMO', 'UNAVAILABLE'].includes(data.executionMode));
+    assert.ok(typeof data.isNeural === 'boolean');
+    assert.ok(data.primaryEngine);
+    assert.ok(data.details);
   });
 
   test('POST /api/audio/verify-watermark rejects arbitrary strings', async () => {
