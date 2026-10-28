@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import express from 'express';
 import http from 'http';
 import { apiRouter } from '../../server/routes/api.ts';
+import { AuthService, PRELOADED_USERS } from '../../server/auth/auth.ts';
 
 describe('Express API Integration Tests', () => {
   let server: http.Server;
   let baseUrl: string;
+  let aliceToken: string;
 
   before((_, done) => {
+    aliceToken = AuthService.issueToken(PRELOADED_USERS['usr_alice_user']);
     const app = express();
     app.use(express.json({ limit: '10mb' }));
     app.use('/api', apiRouter);
@@ -64,6 +67,7 @@ describe('Express API Integration Tests', () => {
     assert.ok(data.challengeId);
     assert.ok(data.nonce);
     assert.ok(data.signature);
+    assert.equal(data.userId, 'anonymous');
   });
 
   test('POST /api/voices/clone/verify-consent fails closed without challenge', async () => {
@@ -139,10 +143,24 @@ describe('Express API Integration Tests', () => {
     assert.ok(data.voices.length >= 5);
   });
 
-  test('POST /api/v1/tts/jobs queues and completes synthesis job', async () => {
-    const res = await fetch(`${baseUrl}/api/v1/tts/jobs`, {
+  test('POST /api/v1/tts/jobs queues and completes synthesis job for authenticated principal', async () => {
+    const anonRes = await fetch(`${baseUrl}/api/v1/tts/jobs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: 'Anonymous attempt must fail closed.',
+        voiceId: 'vf_sarah_en',
+        language: 'en',
+      }),
+    });
+    assert.equal(anonRes.status, 401);
+
+    const res = await fetch(`${baseUrl}/api/v1/tts/jobs`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceToken}`,
+      },
       body: JSON.stringify({
         text: 'Automated test of v1 asynchronous job runner.',
         voiceId: 'vf_sarah_en',
@@ -156,17 +174,32 @@ describe('Express API Integration Tests', () => {
     assert.ok(job.result);
     assert.ok(job.result.audioBase64);
 
-    // Verify polling endpoint
-    const pollRes = await fetch(`${baseUrl}/api/v1/jobs/${job.jobId}`);
+    // Anonymous polling must be rejected; authenticated owner succeeds
+    const anonPollRes = await fetch(`${baseUrl}/api/v1/jobs/${job.jobId}`);
+    assert.equal(anonPollRes.status, 401);
+
+    const pollRes = await fetch(`${baseUrl}/api/v1/jobs/${job.jobId}`, {
+      headers: { Authorization: `Bearer ${aliceToken}` },
+    });
     assert.equal(pollRes.status, 200);
     const polledJob = await pollRes.json();
     assert.equal(polledJob.jobId, job.jobId);
   });
 
-  test('POST /api/v1/projects creates a multi-scene project', async () => {
-    const res = await fetch(`${baseUrl}/api/v1/projects`, {
+  test('POST /api/v1/projects creates a multi-scene project for authenticated principal', async () => {
+    const anonRes = await fetch(`${baseUrl}/api/v1/projects`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Unauthorized Project' }),
+    });
+    assert.equal(anonRes.status, 401);
+
+    const res = await fetch(`${baseUrl}/api/v1/projects`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceToken}`,
+      },
       body: JSON.stringify({
         title: 'Documentary Audio Project',
         targetLanguages: ['en', 'ta'],
@@ -178,16 +211,28 @@ describe('Express API Integration Tests', () => {
     assert.ok(proj.id);
     assert.equal(proj.title, 'Documentary Audio Project');
 
-    const listRes = await fetch(`${baseUrl}/api/v1/projects`);
+    const listRes = await fetch(`${baseUrl}/api/v1/projects`, {
+      headers: { Authorization: `Bearer ${aliceToken}` },
+    });
     assert.equal(listRes.status, 200);
     const listData = await listRes.json();
     assert.ok(listData.projects.some((p: any) => p.id === proj.id));
   });
 
-  test('POST /api/v1/visuals/render executes motion graphics render job', async () => {
-    const res = await fetch(`${baseUrl}/api/v1/visuals/render`, {
+  test('POST /api/v1/visuals/render executes motion graphics render job for authenticated principal', async () => {
+    const anonRes = await fetch(`${baseUrl}/api/v1/visuals/render`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ templateId: 'kinetic_typography' }),
+    });
+    assert.equal(anonRes.status, 401);
+
+    const res = await fetch(`${baseUrl}/api/v1/visuals/render`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${aliceToken}`,
+      },
       body: JSON.stringify({
         templateId: 'kinetic_typography',
         audioDurationSec: 8.5,

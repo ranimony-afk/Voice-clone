@@ -259,7 +259,12 @@ export const MediaTranscribeTranslateView: React.FC<MediaTranscribeTranslateView
 
   const fetchMediaJobs = async () => {
     try {
-      const res = await fetch('/api/media/jobs');
+      const token = typeof window !== 'undefined' ? localStorage.getItem('voiceforge_token') : null;
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      const res = await fetch('/api/media/jobs', { headers });
       const data = await res.json();
       if (data.jobs && Array.isArray(data.jobs)) {
         setMediaJobs(data.jobs);
@@ -291,9 +296,15 @@ export const MediaTranscribeTranslateView: React.FC<MediaTranscribeTranslateView
         b64ToSend = 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
       }
 
+      const token = typeof window !== 'undefined' ? localStorage.getItem('voiceforge_token') : null;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
       const res = await fetch('/api/media/transcribe-translate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           mediaBase64: b64ToSend,
           mimeType: mediaType === 'video' ? 'video/mp4' : 'audio/mp3',

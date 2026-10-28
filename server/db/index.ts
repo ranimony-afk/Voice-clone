@@ -6,6 +6,7 @@
 import { drizzle } from 'drizzle-orm/node-postgres';
 import pg from 'pg';
 import * as schema from './schema.ts';
+import { isRestrictedEnvironment } from '../config/env.ts';
 
 const { Pool } = pg;
 
@@ -40,8 +41,9 @@ export class FatalDatabaseConfigurationError extends Error {
  * In staging and production, missing or malformed database configuration fails closed immediately.
  */
 export function assertDatabaseConfigured(environment?: string): void {
-  const env = environment || process.env.NODE_ENV || 'development';
-  const isStagingOrProd = env === 'production' || env === 'staging';
+  const isStagingOrProd = isRestrictedEnvironment(
+    environment !== undefined ? environment : process.env.NODE_ENV
+  );
 
   if (isStagingOrProd) {
     const dbUrl = process.env.DATABASE_URL;
@@ -102,8 +104,7 @@ export async function checkDatabaseHealth(): Promise<{
   ready: boolean;
   error?: string;
 }> {
-  const env = process.env.NODE_ENV || 'development';
-  const isStagingOrProd = env === 'production' || env === 'staging';
+  const isStagingOrProd = isRestrictedEnvironment(process.env.NODE_ENV);
   const dbUrl = process.env.DATABASE_URL;
   const isConfigured = Boolean(dbUrl && dbUrl.startsWith('postgres'));
 
