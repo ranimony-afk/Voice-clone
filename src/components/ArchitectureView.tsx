@@ -1,9 +1,96 @@
-import React, { useState } from 'react';
-import { Database, ShieldAlert, CheckCircle2, XCircle, Layers, Cpu, Server, Code2, ArrowRight, Zap } from 'lucide-react';
+import React, { useState, useEffect } from 'react';
+import {
+  Database,
+  ShieldAlert,
+  CheckCircle2,
+  XCircle,
+  Layers,
+  Cpu,
+  Server,
+  Code2,
+  ArrowRight,
+  Zap,
+  Copy,
+  Check,
+  ExternalLink,
+  RefreshCw,
+  Globe,
+  Key
+} from 'lucide-react';
 
 export const ArchitectureView: React.FC = () => {
   const [activeSchemaTab, setActiveSchemaTab] = useState('voices');
   const [activeCodeLang, setActiveCodeLang] = useState<'python' | 'typescript'>('python');
+
+  // Database Connection Assistant State
+  const [selectedDbProvider, setSelectedDbProvider] = useState<'supabase' | 'neon' | 'railway' | 'local' | 'cloudsql'>('supabase');
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [liveDbStatus, setLiveDbStatus] = useState<any>(null);
+  const [isCheckingDb, setIsCheckingDb] = useState<boolean>(false);
+
+  // Connection String Builder Form
+  const [builderUser, setBuilderUser] = useState('postgres');
+  const [builderPass, setBuilderPass] = useState('your_strong_password');
+  const [builderHost, setBuilderHost] = useState('db.xxxxxx.supabase.co');
+  const [builderPort, setBuilderPort] = useState('6543');
+  const [builderDbName, setBuilderDbName] = useState('postgres');
+  const [builderSsl, setBuilderSsl] = useState(true);
+
+  // Auto-fill template when provider changes
+  useEffect(() => {
+    if (selectedDbProvider === 'supabase') {
+      setBuilderUser('postgres.your-project-ref');
+      setBuilderHost('aws-0-us-east-1.pooler.supabase.com');
+      setBuilderPort('6543');
+      setBuilderDbName('postgres');
+    } else if (selectedDbProvider === 'neon') {
+      setBuilderUser('alex');
+      setBuilderHost('ep-cool-butterfly-123456.us-east-2.aws.neon.tech');
+      setBuilderPort('5432');
+      setBuilderDbName('neondb');
+    } else if (selectedDbProvider === 'railway') {
+      setBuilderUser('postgres');
+      setBuilderHost('roundhouse.proxy.rlwy.net');
+      setBuilderPort('34567');
+      setBuilderDbName('railway');
+    } else if (selectedDbProvider === 'local') {
+      setBuilderUser('postgres');
+      setBuilderHost('localhost');
+      setBuilderPort('5432');
+      setBuilderDbName('voiceforge');
+    } else if (selectedDbProvider === 'cloudsql') {
+      setBuilderUser('postgres');
+      setBuilderHost('127.0.0.1');
+      setBuilderPort('5432');
+      setBuilderDbName('voiceforge');
+    }
+  }, [selectedDbProvider]);
+
+  // Fetch current live DB health
+  const checkLiveDbStatus = async () => {
+    setIsCheckingDb(true);
+    try {
+      const res = await fetch('/api/db/status');
+      const data = await res.json();
+      setLiveDbStatus(data);
+    } catch (err: any) {
+      setLiveDbStatus({ connected: false, error: err.message });
+    } finally {
+      setIsCheckingDb(false);
+    }
+  };
+
+  useEffect(() => {
+    checkLiveDbStatus();
+  }, []);
+
+  const copyToClipboard = (text: string, keyId: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedKey(keyId);
+    setTimeout(() => setCopiedKey(null), 2500);
+  };
+
+  const computedConnectionString = `postgresql://${builderUser}:${builderPass}@${builderHost}:${builderPort}/${builderDbName}${builderSsl ? '?sslmode=require' : ''}`;
 
   const models = [
     {
@@ -14,7 +101,7 @@ export const ArchitectureView: React.FC = () => {
       rtf: '0.15',
       license: 'Apache 2.0',
       commercial: true,
-      decision: 'SELECTED: Core Multilingual Zero-Shot Engine',
+      decision: 'PROPOSED — NOT DEPLOYED: Core multilingual engine',
       badgeColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
     },
     {
@@ -25,18 +112,18 @@ export const ArchitectureView: React.FC = () => {
       rtf: '0.22',
       license: 'MIT / Apache 2.0',
       commercial: true,
-      decision: 'SELECTED: Dedicated Indic Acoustic Co-Engine',
+      decision: 'PROPOSED — NOT DEPLOYED: Indic acoustic co-engine',
       badgeColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
     },
     {
       name: 'OpenVoice v2',
       arch: 'Tone Color Normalizing Flow',
-      langs: 'Cross-lingual (Universal)',
-      cloning: 'High Timbre Transfer',
+      langs: 'Proposed cross-lingual targets; unavailable',
+      cloning: 'Not enabled or validated',
       rtf: '0.05',
       license: 'MIT',
       commercial: true,
-      decision: 'SELECTED: Cross-Lingual Speaker Transfer Layer',
+      decision: 'PROPOSED — NOT DEPLOYED: Cross-lingual transfer',
       badgeColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
     },
     {
@@ -47,7 +134,7 @@ export const ArchitectureView: React.FC = () => {
       rtf: '0.02',
       license: 'Apache 2.0 / MIT',
       commercial: true,
-      decision: 'SELECTED: Streaming 40ms Audio Synthesizer',
+      decision: 'PROPOSED — NOT DEPLOYED: Streaming vocoder',
       badgeColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
     },
     {
@@ -58,18 +145,18 @@ export const ArchitectureView: React.FC = () => {
       rtf: '0.05',
       license: 'MIT',
       commercial: true,
-      decision: 'SELECTED: Word Timestamps & Dubbing Sync',
+      decision: 'PROPOSED — NOT DEPLOYED: Alignment and dubbing sync',
       badgeColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
     },
     {
       name: 'ECAPA-TDNN (SpeechBrain)',
       arch: 'Time Delay SincNet Embedding',
-      langs: 'Universal 192-dim Voiceprints',
-      cloning: 'Biometric Verification',
-      rtf: '0.01',
-      license: 'Apache 2.0',
+      langs: 'No validated speaker embedding deployed',
+      cloning: 'Identity verification unavailable',
+      rtf: 'Target only; unmeasured',
+      license: 'Apache 2.0 (proposed dependency)',
       commercial: true,
-      decision: 'SELECTED: Biometric Consent & Speaker Verification',
+      decision: 'PROPOSED — NOT DEPLOYED: No ECAPA or identity verifier',
       badgeColor: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30',
     },
     {
@@ -98,28 +185,28 @@ export const ArchitectureView: React.FC = () => {
 
   const dbTables: Record<string, { desc: string; cols: Array<{ name: string; type: string; note: string }> }> = {
     voices: {
-      desc: 'Stores pre-made, user-cloned, and designed voices with 192-dim speaker embeddings.',
+      desc: 'Target schema only; current runtime does not provide owner-scoped cloned-voice persistence. Deterministic placeholder vectors are not trained embeddings or identity evidence.',
       cols: [
         { name: 'id', type: 'UUID', note: 'Primary Key' },
         { name: 'user_id', type: 'UUID', note: 'FK -> users.id (NULL for system voices)' },
         { name: 'name', type: 'VARCHAR(120)', note: 'Display name e.g. "Priya"' },
         { name: 'category', type: 'ENUM', note: 'premade | cloned_instant | cloned_pro | designed' },
         { name: 'primary_language', type: 'ENUM', note: 'en | hi | ta | ml | ja' },
-        { name: 'supported_languages', type: 'ENUM[]', note: 'Cross-lingual synthesis targets' },
-        { name: 'speaker_embedding_vector', type: 'REAL[]', note: '192-dim ECAPA-TDNN embedding' },
+        { name: 'supported_languages', type: 'ENUM[]', note: 'Target languages only; cross-lingual synthesis is unavailable' },
+        { name: 'speaker_embedding_vector', type: 'REAL[]', note: 'Proposed field; no validated ECAPA embedding is produced' },
         { name: 'default_settings', type: 'JSONB', note: 'stability, similarity, style, speed, pitch' },
         { name: 'is_active', type: 'BOOLEAN', note: 'Takedown/Active flag' },
       ],
     },
     consent_records: {
-      desc: 'Immutable biometric verification audit trail for ethical voice cloning compliance.',
+      desc: 'Target schema only. Current consent replay and audit state is process-local; durable owner-scoped or immutable audit persistence is not established.',
       cols: [
         { name: 'id', type: 'UUID', note: 'Primary Key' },
         { name: 'user_id', type: 'UUID', note: 'FK -> users.id' },
         { name: 'voice_id', type: 'UUID', note: 'FK -> voices.id' },
         { name: 'consent_phrase_prompt', type: 'TEXT', note: 'Randomized legal verification prompt' },
         { name: 'recorded_audio_url', type: 'TEXT', note: 'S3 secure vault link' },
-        { name: 'speaker_similarity_score', type: 'REAL', note: 'Must be >= 0.78 threshold' },
+        { name: 'speaker_similarity_score', type: 'REAL', note: 'Proposed metric; no validated identity threshold is established' },
         { name: 'status', type: 'ENUM', note: 'approved | rejected | pending_review' },
         { name: 'verified_at', type: 'TIMESTAMPTZ', note: 'Audit timestamp' },
       ],
@@ -191,6 +278,34 @@ export const ArchitectureView: React.FC = () => {
         { name: 'credits_debited', type: 'INT', note: 'Metered credit quantity' },
       ],
     },
+    video_transform_jobs: {
+      desc: 'Multimodal video animation style transfers (Studio Ghibli, Makoto Shinkai, 90s Cel, 3D Pixar, Claymation, Spider-Verse & Live Action).',
+      cols: [
+        { name: 'id', type: 'VARCHAR(128)', note: 'Primary Key e.g. vjob_1728... ' },
+        { name: 'user_id', type: 'UUID', note: 'FK -> users.id' },
+        { name: 'style_preset', type: 'VARCHAR(60)', note: 'ghibli | makoto_shinkai | retro_anime | pixar_3d | claymation' },
+        { name: 'direction', type: 'VARCHAR(30)', note: 'to_animated | to_realistic ("vice-versa")' },
+        { name: 'custom_prompt', type: 'TEXT', note: 'Artistic guidance prompt modifiers' },
+        { name: 'status', type: 'VARCHAR(30)', note: 'pending | processing | completed | failed' },
+        { name: 'output_video_url', type: 'TEXT', note: 'Rendered video storage location' },
+        { name: 'stylized_keyframe_url', type: 'TEXT', note: 'High-res stylized keyframe preview' },
+        { name: 'scene_analysis', type: 'TEXT', note: 'Gemini multimodal scene analysis' },
+      ],
+    },
+    transcription_translation_jobs: {
+      desc: 'Multimodal audio/video speech-to-text transcriptions, cross-lingual translations, and dubbed speech outputs.',
+      cols: [
+        { name: 'id', type: 'VARCHAR(128)', note: 'Primary Key e.g. trans_1728...' },
+        { name: 'source_lang', type: 'VARCHAR(20)', note: 'Auto-detected source language (EN, FR, DE, ES, ZH, AR, RU, JA)' },
+        { name: 'target_lang', type: 'VARCHAR(20)', note: 'Target translation language (Tamil, Hindi, Malayalam, Japanese, etc.)' },
+        { name: 'full_transcript', type: 'TEXT', note: 'Full speech transcription in native script' },
+        { name: 'translated_text', type: 'TEXT', note: 'Target translation in native destination script' },
+        { name: 'phonetic_guide', type: 'TEXT', note: 'Romanized phonetic guide' },
+        { name: 'transcript_segments', type: 'JSONB', note: 'Time-aligned segments with start/end timecodes' },
+        { name: 'dubbed_audio_url', type: 'TEXT', note: 'Synthesized voiceover audio WAV' },
+        { name: 'srt_content', type: 'TEXT', note: 'Formatted SRT subtitle file' },
+      ],
+    },
   };
 
   return (
@@ -206,17 +321,17 @@ export const ArchitectureView: React.FC = () => {
               VoiceForge System Architecture & Model Selection
             </h2>
             <p className="mt-2 text-slate-300 max-w-3xl leading-relaxed text-sm">
-              Architected for low-latency streaming TTS (<strong className="text-white">&lt;450ms TTFB</strong>), zero-shot cloning from 10–60s audio, and native phonetic nuance across English, Tamil, Hindi, Malayalam, and Japanese.
+              This is a proposed architecture, not a deployment or capability report. Model names, language coverage, latency figures, and cloning components below are design targets; they are not evidence of installed models, validated inference, identity verification, or released cross-lingual synthesis.
             </p>
           </div>
           <div className="grid grid-cols-2 gap-3 text-center min-w-[240px]">
             <div className="bg-slate-900/80 border border-slate-800 p-3 rounded-xl">
               <div className="text-2xl font-black text-indigo-400">5</div>
-              <div className="text-xs text-slate-400 font-medium">Core Languages</div>
+              <div className="text-xs text-slate-400 font-medium">Target Languages</div>
             </div>
             <div className="bg-slate-900/80 border border-slate-800 p-3 rounded-xl">
-              <div className="text-2xl font-black text-emerald-400">100%</div>
-              <div className="text-xs text-slate-400 font-medium">Commercial Legal</div>
+              <div className="text-xl font-black text-amber-300">Review</div>
+              <div className="text-xs text-slate-400 font-medium">License evidence required</div>
             </div>
           </div>
         </div>
@@ -227,7 +342,7 @@ export const ArchitectureView: React.FC = () => {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <Cpu className="w-5 h-5 text-indigo-400" />
-            <h3 className="text-xl font-bold text-white">Model Selection & License Audit</h3>
+            <h3 className="text-xl font-bold text-white">Proposed Model Candidates & License Review</h3>
           </div>
           <span className="text-xs text-slate-400">Evaluated against Apache 2.0 / MIT / CPML / CC-BY-NC</span>
         </div>
@@ -238,7 +353,7 @@ export const ArchitectureView: React.FC = () => {
               <tr>
                 <th className="py-3 px-4">Model & Architecture</th>
                 <th className="py-3 px-4">Language Coverage</th>
-                <th className="py-3 px-4">Zero-Shot Cloning</th>
+                <th className="py-3 px-4">Proposed Cloning Role</th>
                 <th className="py-3 px-4">RTF / Latency</th>
                 <th className="py-3 px-4">License</th>
                 <th className="py-3 px-4">Commercial?</th>
@@ -283,7 +398,7 @@ export const ArchitectureView: React.FC = () => {
       <section className="space-y-4">
         <div className="flex items-center gap-2.5">
           <Layers className="w-5 h-5 text-indigo-400" />
-          <h3 className="text-xl font-bold text-white">High-Level Pipeline & Data Flow</h3>
+          <h3 className="text-xl font-bold text-white">Proposed Pipeline & Data Flow (Not Deployed)</h3>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -307,12 +422,12 @@ export const ArchitectureView: React.FC = () => {
               <span className="text-xs font-bold uppercase tracking-wider">Tier 2</span>
               <Cpu className="w-4 h-4" />
             </div>
-            <h4 className="font-bold text-white">Acoustic & Cloning Engine</h4>
+            <h4 className="font-bold text-white">Proposed Acoustic & Cloning Components (Unavailable)</h4>
             <ul className="text-xs text-slate-400 space-y-1.5 list-disc pl-4">
-              <li><strong>CosyVoice 2</strong>: Zero-shot flow matching</li>
-              <li><strong>AI4Bharat Indic</strong>: Tamil/Hindi/Malayalam</li>
-              <li><strong>ECAPA-TDNN</strong>: 192-dim speaker vectors</li>
-              <li><strong>Consent Verifier</strong>: Cosine match &ge;0.78</li>
+              <li><strong>CosyVoice 2</strong>: Proposed; not deployed</li>
+              <li><strong>AI4Bharat Indic</strong>: Proposed; not deployed</li>
+              <li><strong>ECAPA-TDNN</strong>: No validated model or speaker vectors available</li>
+              <li><strong>Consent checks</strong>: Release-gated; audio similarity/HMAC do not prove identity or consent</li>
             </ul>
           </div>
 
@@ -323,7 +438,7 @@ export const ArchitectureView: React.FC = () => {
             </div>
             <h4 className="font-bold text-white">Vocoder & Streaming</h4>
             <ul className="text-xs text-slate-400 space-y-1.5 list-disc pl-4">
-              <li><strong>Vocos Streaming Vocoder</strong> (40ms chunks)</li>
+              <li><strong>Vocos Streaming Vocoder</strong>: proposed (40ms chunk target; not validated)</li>
               <li>HTTP Chunked / WebSocket dispatch</li>
               <li>Spread-spectrum Audio Watermarking</li>
               <li>Crossfade seamless sentence stitching</li>
@@ -346,12 +461,376 @@ export const ArchitectureView: React.FC = () => {
         </div>
       </section>
 
+      {/* 2.5. Interactive DATABASE_URL Setup Guide & Connection Assistant */}
+      <section className="space-y-6 bg-slate-900/90 border border-indigo-500/30 rounded-2xl p-6 sm:p-8 shadow-2xl">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-800 pb-5">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center text-indigo-400">
+              <Database className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                DATABASE_URL Setup & Connection Assistant
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono">
+                  Drizzle ORM
+                </span>
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Step-by-step exact instructions to locate and configure your PostgreSQL database connection string.
+              </p>
+            </div>
+          </div>
+
+          {/* Connection health can be queried; migrations are disabled by the public API. */}
+          <div className="space-y-2 text-right">
+            <button
+              type="button"
+              onClick={checkLiveDbStatus}
+              disabled={isCheckingDb}
+              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold inline-flex items-center gap-1.5 transition-all"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isCheckingDb ? 'animate-spin text-amber-400' : 'text-slate-400'}`} />
+              <span>Check connection status</span>
+            </button>
+            <p className="text-[11px] text-amber-200 max-w-sm">
+              Public API migrations are disabled (503). This UI cannot run or verify a schema migration.
+            </p>
+          </div>
+        </div>
+
+        {/* A health response is not evidence that target schema migrations are complete. */}
+        <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2.5">
+            <div className={`w-2.5 h-2.5 rounded-full ${liveDbStatus?.connected === true ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+            <div>
+              <span className="font-semibold text-white">Database connection check: </span>
+              <span className="font-mono text-indigo-300 font-bold">
+                {liveDbStatus?.error
+                  ? 'Status check failed'
+                  : liveDbStatus?.connected === true
+                    ? `API reports connected${liveDbStatus.database ? ` • ${liveDbStatus.database}` : ''}`
+                    : liveDbStatus?.connected === false
+                      ? 'API reports not connected'
+                      : 'Not verified'}
+              </span>
+              {liveDbStatus?.provider && <span className="text-slate-400 ml-2">Provider reported: {liveDbStatus.provider}</span>}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 text-[11px] text-slate-400">
+            {liveDbStatus?.pingMs && <span>Reported ping: <strong className="text-slate-300">{liveDbStatus.pingMs}ms</strong></span>}
+            <span>Target schema only; migration and table readiness are not verified here.</span>
+          </div>
+        </div>
+
+        {/* Provider Selector Tabs */}
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Choose Database Host Provider</span>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+            {[
+              { id: 'supabase', name: 'Supabase', desc: 'Cloud & PgBouncer', color: 'from-emerald-500 to-teal-600' },
+              { id: 'neon', name: 'Neon Serverless', desc: 'Auto-scale branching', color: 'from-cyan-500 to-blue-600' },
+              { id: 'railway', name: 'Railway', desc: 'One-click deploy', color: 'from-purple-500 to-pink-600' },
+              { id: 'local', name: 'Local / Docker', desc: 'Localhost:5432', color: 'from-amber-500 to-orange-600' },
+              { id: 'cloudsql', name: 'Google Cloud SQL', desc: 'GCP Enterprise', color: 'from-blue-500 to-indigo-600' },
+            ].map((prov) => (
+              <button
+                key={prov.id}
+                onClick={() => setSelectedDbProvider(prov.id as any)}
+                className={`p-3 rounded-xl border text-left transition-all relative overflow-hidden ${
+                  selectedDbProvider === prov.id
+                    ? 'border-indigo-500 bg-indigo-950/40 shadow-lg ring-1 ring-indigo-500'
+                    : 'border-slate-800 bg-slate-950 hover:bg-slate-900/60'
+                }`}
+              >
+                <div className="font-bold text-xs text-white flex items-center justify-between">
+                  <span>{prov.name}</span>
+                  {selectedDbProvider === prov.id && <Check className="w-3.5 h-3.5 text-indigo-400" />}
+                </div>
+                <div className="text-[10px] text-slate-400 mt-1">{prov.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Provider Specific Step-by-Step Instructions */}
+        <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-4">
+          {selectedDbProvider === 'supabase' && (
+            <div className="space-y-4 text-xs">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                  <span className="w-5 h-5 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-[11px] font-bold">1</span>
+                  Exact Click-by-Click Steps in Supabase Dashboard
+                </h4>
+                <a
+                  href="https://supabase.com/dashboard"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-semibold"
+                >
+                  <span>Open Supabase Dashboard</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+
+              <ol className="list-decimal list-inside space-y-2.5 text-slate-300 leading-relaxed pl-1">
+                <li>
+                  Go to <strong className="text-white">supabase.com/dashboard</strong> and select your project.
+                </li>
+                <li>
+                  In the bottom of the left sidebar, click the ⚙️ <strong className="text-white">Project Settings</strong> gear icon.
+                </li>
+                <li>
+                  Under the Project Settings sidebar menu, click on <strong className="text-white">Database</strong>.
+                </li>
+                <li>
+                  Scroll down to the section titled <strong className="text-white">Connection string</strong>.
+                </li>
+                <li>
+                  Select the <strong className="text-white">URI</strong> tab (do NOT select "Parameters" or "Node.js").
+                </li>
+                <li>
+                  Choose <strong className="text-white">Mode: Transaction</strong> (Port <code className="bg-slate-900 px-1 py-0.5 rounded text-amber-300 font-mono">6543</code>).
+                  <span className="block text-[11px] text-slate-400 mt-0.5">
+                    💡 Port 6543 connects via Supavisor pooler, which prevents connection exhaustion in web apps.
+                  </span>
+                </li>
+                <li>
+                  Copy the URI. It will look like:
+                  <div className="mt-1.5 p-2.5 bg-slate-900 rounded-lg font-mono text-[11px] text-emerald-300 flex items-center justify-between overflow-x-auto">
+                    <span>postgresql://postgres.[project-ref]:[YOUR-PASSWORD]@aws-0-[region].pooler.supabase.com:6543/postgres</span>
+                    <button
+                      onClick={() => copyToClipboard('postgresql://postgres.[project-ref]:[YOUR-PASSWORD]@aws-0-[region].pooler.supabase.com:6543/postgres', 'supa_tmpl')}
+                      className="ml-2 px-2 py-1 rounded bg-slate-800 text-slate-300 hover:text-white shrink-0"
+                    >
+                      {copiedKey === 'supa_tmpl' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                    </button>
+                  </div>
+                </li>
+                <li>
+                  Replace <code className="text-amber-300 font-mono">[YOUR-PASSWORD]</code> with the database password you chose when creating the Supabase project.
+                  <span className="block text-[11px] text-amber-400/80 mt-0.5">
+                    ⚠️ Note: If your password has special characters like <code className="text-white">@</code> or <code className="text-white">#</code>, URL-encode them (e.g., <code className="text-white">@</code> becomes <code className="text-white">%40</code>).
+                  </span>
+                </li>
+              </ol>
+            </div>
+          )}
+
+          {selectedDbProvider === 'neon' && (
+            <div className="space-y-4 text-xs">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                  <span className="w-5 h-5 rounded-full bg-cyan-500/20 text-cyan-400 flex items-center justify-center text-[11px] font-bold">1</span>
+                  Exact Steps in Neon (neon.tech)
+                </h4>
+                <a
+                  href="https://console.neon.tech"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs text-cyan-400 hover:text-cyan-300 flex items-center gap-1 font-semibold"
+                >
+                  <span>Open Neon Console</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+
+              <ol className="list-decimal list-inside space-y-2 text-slate-300 pl-1">
+                <li>Log in to <strong className="text-white">console.neon.tech</strong> and open your project.</li>
+                <li>On the main project Dashboard, locate the <strong className="text-white">Connection Details</strong> card.</li>
+                <li>Check the <strong className="text-white">Pooled connection</strong> checkbox (adds <code className="text-cyan-300 font-mono">-pooler</code> to endpoint).</li>
+                <li>Copy the connection string (it includes the password automatically if generated recently).</li>
+                <li>Template format:
+                  <div className="mt-1 p-2 bg-slate-900 rounded font-mono text-[11px] text-cyan-300">
+                    postgresql://alex:AbCdEf123456@ep-cool-butterfly-123456.us-east-2.aws.neon.tech/neondb?sslmode=require
+                  </div>
+                </li>
+              </ol>
+            </div>
+          )}
+
+          {selectedDbProvider === 'railway' && (
+            <div className="space-y-4 text-xs">
+              <div className="flex items-center justify-between">
+                <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                  <span className="w-5 h-5 rounded-full bg-purple-500/20 text-purple-400 flex items-center justify-center text-[11px] font-bold">1</span>
+                  Exact Steps in Railway (railway.com)
+                </h4>
+                <a
+                  href="https://railway.com"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-xs text-purple-400 hover:text-purple-300 flex items-center gap-1 font-semibold"
+                >
+                  <span>Open Railway</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+
+              <ol className="list-decimal list-inside space-y-2 text-slate-300 pl-1">
+                <li>Go to your Railway project canvas.</li>
+                <li>Click on the <strong className="text-white">PostgreSQL</strong> service card.</li>
+                <li>Click on the <strong className="text-white">Variables</strong> tab at the top.</li>
+                <li>
+                  Copy the value of <strong className="text-white">DATABASE_URL</strong> (or <strong className="text-white">DATABASE_PUBLIC_URL</strong> if connecting from external networks).
+                </li>
+                <li>Template:
+                  <div className="mt-1 p-2 bg-slate-900 rounded font-mono text-[11px] text-purple-300">
+                    postgresql://postgres:random_pwd@roundhouse.proxy.rlwy.net:34567/railway
+                  </div>
+                </li>
+              </ol>
+            </div>
+          )}
+
+          {selectedDbProvider === 'local' && (
+            <div className="space-y-4 text-xs">
+              <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                <span className="w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 flex items-center justify-center text-[11px] font-bold">1</span>
+                Local PostgreSQL / Docker One-Liner
+              </h4>
+
+              <div className="space-y-2 text-slate-300">
+                <p>Run PostgreSQL locally in Docker with a single terminal command:</p>
+                <div className="p-2.5 bg-slate-900 rounded-lg font-mono text-[11px] text-amber-300 flex items-center justify-between overflow-x-auto">
+                  <span>docker run --name voiceforge-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=voiceforge -p 5432:5432 -d postgres:16-alpine</span>
+                  <button
+                    onClick={() => copyToClipboard('docker run --name voiceforge-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=voiceforge -p 5432:5432 -d postgres:16-alpine', 'dock_cmd')}
+                    className="ml-2 px-2 py-1 rounded bg-slate-800 text-slate-300 hover:text-white shrink-0"
+                  >
+                    {copiedKey === 'dock_cmd' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-400">Connection string: <code className="text-white font-mono">postgresql://postgres:postgres@localhost:5432/voiceforge</code></p>
+              </div>
+            </div>
+          )}
+
+          {selectedDbProvider === 'cloudsql' && (
+            <div className="space-y-4 text-xs">
+              <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                <span className="w-5 h-5 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center text-[11px] font-bold">1</span>
+                Google Cloud SQL (PostgreSQL)
+              </h4>
+
+              <ol className="list-decimal list-inside space-y-2 text-slate-300 pl-1">
+                <li>In Google Cloud Console, open <strong className="text-white">Cloud SQL</strong> &gt; <strong className="text-white">Instances</strong>.</li>
+                <li>Click your PostgreSQL instance to view its <strong className="text-white">Public IP address</strong> or <strong className="text-white">Instance connection name</strong>.</li>
+                <li>Under <strong className="text-white">Users</strong>, verify your user or create one.</li>
+                <li>Under <strong className="text-white">Connections</strong> &gt; <strong className="text-white">Authorized networks</strong>, add your client IP (or connect via Cloud SQL Auth Proxy on port 5432).</li>
+                <li>Template format:
+                  <div className="mt-1 p-2 bg-slate-900 rounded font-mono text-[11px] text-blue-300">
+                    postgresql://postgres:password@YOUR_CLOUDSQL_IP:5432/voiceforge?sslmode=require
+                  </div>
+                </li>
+              </ol>
+            </div>
+          )}
+        </div>
+
+        {/* Interactive Connection String Builder */}
+        <div className="p-5 rounded-xl bg-slate-950 border border-slate-800 space-y-4">
+          <div className="flex items-center justify-between">
+            <h4 className="text-sm font-bold text-white flex items-center gap-2">
+              <span className="w-5 h-5 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-[11px] font-bold">2</span>
+              Interactive DATABASE_URL Builder & Formatter
+            </h4>
+            <span className="text-[11px] text-slate-400">Type credentials to generate copy-paste URL</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+            <div>
+              <label className="block text-[11px] font-bold text-slate-400 mb-1">Database User</label>
+              <input
+                type="text"
+                value={builderUser}
+                onChange={(e) => setBuilderUser(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono text-xs focus:border-indigo-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-slate-400 mb-1">Database Password</label>
+              <input
+                type="password"
+                value={builderPass}
+                onChange={(e) => setBuilderPass(e.target.value)}
+                placeholder="password"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono text-xs focus:border-indigo-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-slate-400 mb-1">Host / Hostname</label>
+              <input
+                type="text"
+                value={builderHost}
+                onChange={(e) => setBuilderHost(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono text-xs focus:border-indigo-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-slate-400 mb-1">Port</label>
+              <input
+                type="text"
+                value={builderPort}
+                onChange={(e) => setBuilderPort(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono text-xs focus:border-indigo-500 focus:outline-none"
+              />
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-bold text-slate-400 mb-1">Database Name</label>
+              <input
+                type="text"
+                value={builderDbName}
+                onChange={(e) => setBuilderDbName(e.target.value)}
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-white font-mono text-xs focus:border-indigo-500 focus:outline-none"
+              />
+            </div>
+
+            <div className="flex items-center gap-2 pt-6">
+              <label className="flex items-center gap-2 cursor-pointer text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={builderSsl}
+                  onChange={(e) => setBuilderSsl(e.target.checked)}
+                  className="rounded bg-slate-900 border-slate-800 text-indigo-600 accent-indigo-600"
+                />
+                <span className="font-semibold text-xs">Append SSL (?sslmode=require)</span>
+              </label>
+            </div>
+          </div>
+
+          {/* Generated Result Box */}
+          <div className="space-y-1.5 pt-2">
+            <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Ready-to-Use Connection String</span>
+            <div className="p-3 bg-slate-900 border border-slate-800 rounded-xl flex items-center justify-between gap-3">
+              <span className="font-mono text-xs text-indigo-300 truncate select-all">
+                {computedConnectionString}
+              </span>
+              <button
+                onClick={() => copyToClipboard(computedConnectionString, 'built_str')}
+                className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center gap-1.5 shrink-0 shadow"
+              >
+                {copiedKey === 'built_str' ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedKey === 'built_str' ? 'Copied!' : 'Copy DATABASE_URL'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* 3. PostgreSQL Database Schema Explorer */}
       <section className="space-y-4">
         <div className="flex items-center justify-between flex-wrap gap-2">
           <div className="flex items-center gap-2.5">
             <Database className="w-5 h-5 text-indigo-400" />
-            <h3 className="text-xl font-bold text-white">PostgreSQL Database Schema (11 Core Tables)</h3>
+            <h3 className="text-xl font-bold text-white">Target PostgreSQL Schema (Design Proposal)</h3>
           </div>
           <span className="text-xs text-slate-400 font-mono-code">schema file: /docs/DB_SCHEMA.sql</span>
         </div>
@@ -409,7 +888,7 @@ export const ArchitectureView: React.FC = () => {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <Code2 className="w-5 h-5 text-indigo-400" />
-            <h3 className="text-xl font-bold text-white">Pluggable Engine Interface Contract</h3>
+            <h3 className="text-xl font-bold text-white">Illustrative Proposed Engine Interface</h3>
           </div>
           <div className="flex items-center bg-slate-900 border border-slate-800 rounded-lg p-1 text-xs">
             <button
@@ -418,7 +897,7 @@ export const ArchitectureView: React.FC = () => {
                 activeCodeLang === 'python' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
               }`}
             >
-              Python (Inference Engine)
+              Python (proposed interface)
             </button>
             <button
               onClick={() => setActiveCodeLang('typescript')}
@@ -426,7 +905,7 @@ export const ArchitectureView: React.FC = () => {
                 activeCodeLang === 'typescript' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
               }`}
             >
-              TypeScript (API Server)
+              TypeScript (proposed interface)
             </button>
           </div>
         </div>

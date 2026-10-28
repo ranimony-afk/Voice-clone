@@ -1,0 +1,33 @@
+[project]
+name = "voiceforge-omnivoice-service"
+version = "0.1.0"
+description = "VoiceForge OmniVoice inference service — FastAPI wrapper around the pinned OmniVoice TTS engine (k2-fsa/OmniVoice, Apache-2.0). Runs analysis-only without model weights; neural synthesis requires weights + adequate hardware."
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "numpy",
+    "soundfile",
+]
+
+[project.optional-dependencies]
+# Real engine — install ONLY in the GPU/inference image.
+# Pin mirrors THIRD_PARTY_INVENTORY.md ADR-001 (upstream git 08be0b4c == PyPI 0.2.1).
+engine = [
+    "omnivoice==0.2.1",
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+]
+# zh/en text normalization for generate(normalize_text=True)
+tn = [
+    "omnivoice[tn]==0.2.1",
+]
+dev = [
+    "pytest",
+    "httpx",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -6,3 +6,20 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# M0 audit: local clones of upstream repos — never commit upstream histories
+third_party/
+
+# Model weights / voice-clone prompts / private audio must never enter git
+*.pt
+*.safetensors
+*.ckpt
+
+# Build artifacts and local Python environments
+/dist-server/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+**/.venv/
+/services/omnivoice/data/prompts/

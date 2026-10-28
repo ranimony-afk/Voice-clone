@@ -1,0 +1,16 @@
+node_modules
+__pycache__
+.pytest_cache
+.venv
+services/omnivoice/.venv
+third_party
+.git
+.env
+.env.*
+!.env.example
+*.pt
+*.safetensors
+*.ckpt
+models
+coverage
+dist-server

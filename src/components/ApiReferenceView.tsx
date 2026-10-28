@@ -12,12 +12,13 @@ export const ApiReferenceView: React.FC = () => {
   };
 
   const codeSnippets = {
-    python: `# VoiceForge Official Python SDK (pip install voiceforge)
+    python: `# Illustrative pseudocode only; no supported Python SDK/package is shipped here.
 from voiceforge import VoiceForgeClient, Language
 
-client = VoiceForgeClient(api_key="vf_live_your_api_key_here")
+# This placeholder API key is not evidence of server-side end-user authentication.
+client = VoiceForgeClient(api_key="<example-only>")
 
-# 1. Text-to-Speech with Multilingual Tamil & Hindi
+# 1. Illustrative TTS example; provider-backed use is release/environment gated.
 audio_bytes = client.tts.synthesize(
     text="கப்பல் கடலில் சென்றது. தங்கம் விலை ₹65,400 ஆக உயர்ந்தது.",
     voice_id="vf_priya_ta",
@@ -30,31 +31,26 @@ audio_bytes = client.tts.synthesize(
 with open("output.wav", "wb") as f:
     f.write(audio_bytes)
 
-# 2. Low-latency Streaming TTS (<450ms TTFB)
+# 2. Streaming example only; no latency or provider availability is guaranteed.
+# Live/provider-backed streaming is not generally available.
 for chunk in client.tts.synthesize_stream(
-    text="Welcome to VoiceForge low-latency neural streaming.",
+    text="Illustrative streaming example.",
     voice_id="vf_sarah_en"
 ):
     stream_audio_to_speakers(chunk.pcm_bytes)
 
-# 3. Instant Voice Cloning with Consent Verification
-new_voice = client.voices.clone(
-    name="Meera Studio",
-    reference_audio_path="meera_sample_30s.wav",
-    consent_audio_path="meera_consent_phrase.wav",
-    target_languages=[Language.TAMIL, Language.HINDI, Language.ENGLISH]
-)
-print(f"Cloned voice provisioned: {new_voice.id}")`,
+# 3. Cloning is unavailable: current clone/enrollment routes are release-gated (503).
+# No SDK call here provisions a voice or verifies identity, liveness, or consent.`,
 
-    node: `// VoiceForge Node.js SDK (npm install @voiceforge/sdk)
+    node: `// Illustrative pseudocode only; @voiceforge/sdk is not shipped or supported here.
 import { VoiceForgeClient } from '@voiceforge/sdk';
 import * as fs from 'fs';
 
-const client = new VoiceForgeClient({
-  apiKey: process.env.VOICEFORGE_API_KEY
-});
+// This example key is not validated by the current API as end-user authentication.
+const client = new VoiceForgeClient({ apiKey: '<example-only>' });
 
-// 1. Synthesize Multilingual Utterance
+// TTS use is gated; provider-backed availability and performance are not guaranteed.
+// 1. Illustrative multilingual synthesis example
 async function run() {
   const response = await client.tts.synthesize({
     text: 'कमल और कमला ने डॉक्टर साहब को ₹5,50,000 का चेक दिया।',
@@ -68,14 +64,15 @@ async function run() {
   });
 
   fs.writeFileSync('output.wav', Buffer.from(response.audioBase64, 'base64'));
-  console.log(\`Generated in \${response.generationTimeMs}ms (Watermark: \${response.watermarkSignature})\`);
+  // If supplied by a deployed service, watermark metadata concerns artifact integrity/provenance only;
+  // it does not prove speaker identity or consent. This response is illustrative pseudocode.
 }
 
 run();`,
 
-    curl: `# 1. Text-to-Speech Synthesis Endpoint
+    curl: `# Illustrative request only; the server does not establish end-user auth from a Bearer header.
+# TTS may return 503; only an explicit non-production local formant stub is conditionally allowed.
 curl -X POST "http://localhost:3000/api/tts/synthesize" \\
-  -H "Authorization: Bearer vf_live_your_key" \\
   -H "Content-Type: application/json" \\
   -d '{
     "text": "Hello world! வணக்கம், நமஸ்காரம், こんにちは!",
@@ -97,11 +94,12 @@ curl -X POST "http://localhost:3000/api/frontend/analyze" \\
     "language": "ta"
   }'
 
-# 3. Audio Watermark Verification
+# 3. Watermark integrity/provenance check (not proof of speaker identity or consent).
+# Replace this placeholder with a valid system-issued signature; this is not a working credential.
 curl -X POST "http://localhost:3000/api/audio/verify-watermark" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "signature": "18f8e8b39a3f4c718b5329124a9cb481"
+    "signature": "<system-issued-signature>"
   }'`,
   };
 
@@ -113,10 +111,10 @@ curl -X POST "http://localhost:3000/api/audio/verify-watermark" \\
           <div className="p-2 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-400">
             <Zap className="w-5 h-5" />
           </div>
-          <h2 className="text-2xl font-bold text-white">Developer REST API & SDKs</h2>
+          <h2 className="text-2xl font-bold text-white">Illustrative API Examples & Capability Status</h2>
         </div>
         <p className="text-sm text-slate-300 max-w-3xl leading-relaxed">
-          Comprehensive programmatic interface for real-time text-to-speech, streaming websockets, biometric voice cloning, and audio provenance verification.
+          These examples are illustrative, not supported SDKs or proof of service availability. Clone, enrollment, upload, export, and cross-lingual routes are release-gated (503). Provider-backed TTS and live streaming are not generally available; only a specific non-production local formant TTS stub may be enabled. The shown Bearer/API-key placeholders do not establish end-user authentication. Watermark HMACs concern artifact integrity/provenance, not speaker identity or consent. No offline voice-model export is available.
         </p>
       </div>
 
@@ -130,7 +128,7 @@ curl -X POST "http://localhost:3000/api/audio/verify-watermark" \\
                 activeLang === 'python' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
               }`}
             >
-              Python SDK
+              Python example
             </button>
             <button
               onClick={() => setActiveLang('node')}
@@ -138,7 +136,7 @@ curl -X POST "http://localhost:3000/api/audio/verify-watermark" \\
                 activeLang === 'node' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
               }`}
             >
-              Node.js SDK
+              Node.js example
             </button>
             <button
               onClick={() => setActiveLang('curl')}

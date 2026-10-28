@@ -26,74 +26,39 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
   const [audioDuration, setAudioDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
   const [metaInfo, setMetaInfo] = useState<{
-    latencyMs: number;
-    credits: number;
-    watermark: string;
-    phonemes: string;
+    latencyMs: number; credits: number; watermark: string; phonemes: string; engineUsed: string; isNeural: boolean;
   } | null>(null);
-
+  const [generationError, setGenerationError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-
   const selectedVoice = voices.find(v => v.id === selectedVoiceId) || voices[0];
 
   useEffect(() => {
-    if (selectedVoice) {
-      setSettings(selectedVoice.defaultSettings);
-    }
+    if (selectedVoice) setSettings(selectedVoice.defaultSettings);
   }, [selectedVoiceId]);
 
   const handleGenerate = async () => {
     if (!text.trim()) return;
-    setGenerating(true);
-    setIsPlaying(false);
-
+    setGenerating(true); setIsPlaying(false); setGenerationError(null);
     try {
       const res = await fetch('/api/tts/synthesize', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text,
-          voiceId: selectedVoiceId,
-          language: selectedVoice.primaryLanguage,
-          settings,
-        }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voiceId: selectedVoiceId, language: selectedVoice.primaryLanguage, settings }),
       });
-
       const data = await res.json();
-      if (data.audioBase64) {
-        const byteCharacters = atob(data.audioBase64);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {
-          byteNumbers[i] = byteCharacters.charCodeAt(i);
-        }
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], { type: 'audio/wav' });
-        const url = URL.createObjectURL(blob);
-
-        if (audioUrl) URL.revokeObjectURL(audioUrl);
-        setAudioUrl(url);
-        setAudioDuration(data.durationSeconds);
-        setCurrentTime(0);
-        setMetaInfo({
-          latencyMs: data.generationTimeMs,
-          credits: data.creditsCharged,
-          watermark: data.watermarkSignature,
-          phonemes: data.phonemes,
-        });
-
-        // Autoplay
-        setTimeout(() => {
-          if (audioRef.current) {
-            audioRef.current.currentTime = 0;
-            audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
-          }
-        }, 100);
-      }
+      if (!res.ok || !data.audioBase64) throw new Error(data.error?.message || data.error || `Synthesis failed (${res.status})`);
+      const byteCharacters = atob(data.audioBase64);
+      const byteNumbers = new Array(byteCharacters.length);
+      for (let i = 0; i < byteCharacters.length; i++) byteNumbers[i] = byteCharacters.charCodeAt(i);
+      const blob = new Blob([new Uint8Array(byteNumbers)], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      setAudioUrl(url); setAudioDuration(data.durationSeconds); setCurrentTime(0);
+      setMetaInfo({ latencyMs: data.generationTimeMs, credits: data.creditsCharged, watermark: data.watermarkSignature, phonemes: data.phonemes, engineUsed: data.engineUsed || 'unknown', isNeural: Boolean(data.isNeural) });
+      setTimeout(() => { if (audioRef.current) { audioRef.current.currentTime = 0; audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {}); } }, 100);
     } catch (err) {
-      console.error('Synthesis failed:', err);
-    } finally {
-      setGenerating(false);
-    }
+      const message = err instanceof Error ? err.message : 'Synthesis failed';
+      setGenerationError(message); console.error('Synthesis failed:', err);
+    } finally { setGenerating(false); }
   };
 
   const togglePlay = () => {
@@ -169,8 +134,12 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
                   <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono-code uppercase">
                     {voice.primaryLanguage}
                   </span>
-                  <span className="text-indigo-400 capitalize font-medium">
-                    {voice.category.replace('_', ' ')}
+                  <span className={`capitalize font-semibold ${
+                    voice.category.includes('clone')
+                      ? 'text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20'
+                      : 'text-indigo-400'
+                  }`}>
+                    {voice.category.includes('clone') ? '⭐ Cloned Voice' : voice.category.replace('_', ' ')}
                   </span>
                 </div>
               </button>
@@ -318,12 +287,15 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
               </div>
 
               {/* Watermark Provenance */}
+              {generationError && <div role="alert" className="mb-4 rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 text-sm text-rose-200">Synthesis unavailable: {generationError}</div>}
               {metaInfo && (
                 <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-400">
-                  <div className="flex items-center gap-1.5 text-emerald-400">
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    <span>Cryptographic Watermark Embedded:</span>
-                    <span className="font-mono-code text-slate-300">{metaInfo.watermark}</span>
+                  <div className="flex flex-col gap-1">
+                    <div className={`flex items-center gap-1.5 ${metaInfo.isNeural ? 'text-emerald-400' : 'text-amber-300'}`}>
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      <span>{metaInfo.isNeural ? 'Neural inference' : 'DEVELOPMENT-ONLY simulated audio'}: {metaInfo.engineUsed}</span>
+                    </div>
+                    <div className="text-slate-500">Signed provenance metadata (not an in-audio watermark): <span className="font-mono-code text-slate-300">{metaInfo.watermark}</span></div>
                   </div>
                 </div>
               )}
@@ -335,64 +307,11 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
         <div className="lg:col-span-4 space-y-6 bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
           <div className="flex items-center gap-2 text-sm font-bold text-white uppercase tracking-wider">
             <Sliders className="w-4 h-4 text-indigo-400" />
-            <span>Acoustic Voice Controls</span>
+            <span>OmniVoice Controls</span>
           </div>
 
           <div className="space-y-4">
-            {/* Stability */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-300 font-medium">Stability</span>
-                <span className="font-mono-code text-indigo-400">{(settings.stability * 100).toFixed(0)}%</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={settings.stability}
-                onChange={(e) => setSettings({ ...settings, stability: parseFloat(e.target.value) })}
-                className="w-full accent-indigo-500 cursor-pointer"
-              />
-              <p className="text-[11px] text-slate-500">Higher = more monotonic consistency; Lower = wider emotional pitch.</p>
-            </div>
-
-            {/* Similarity */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-300 font-medium">Similarity (Timbre Closeness)</span>
-                <span className="font-mono-code text-indigo-400">{(settings.similarity * 100).toFixed(0)}%</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={settings.similarity}
-                onChange={(e) => setSettings({ ...settings, similarity: parseFloat(e.target.value) })}
-                className="w-full accent-indigo-500 cursor-pointer"
-              />
-              <p className="text-[11px] text-slate-500">Weights the target 192-dim ECAPA speaker embedding.</p>
-            </div>
-
-            {/* Style / Expressiveness */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-300 font-medium">Style / Expressiveness</span>
-                <span className="font-mono-code text-indigo-400">{(settings.style * 100).toFixed(0)}%</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.05"
-                value={settings.style}
-                onChange={(e) => setSettings({ ...settings, style: parseFloat(e.target.value) })}
-                className="w-full accent-indigo-500 cursor-pointer"
-              />
-              <p className="text-[11px] text-slate-500">Amplifies dramatic pauses and micro-intonation inflection.</p>
-            </div>
-
+            <p className="text-xs text-slate-400">Only documented OmniVoice parameters are exposed. Stability, similarity, pitch-shift, and speaker-boost controls are not claimed because this engine does not implement them.</p>
             {/* Speed */}
             <div className="space-y-1.5">
               <div className="flex items-center justify-between text-xs">
@@ -410,37 +329,6 @@ export const TTSStudioView: React.FC<TTSStudioViewProps> = ({ voices }) => {
               />
             </div>
 
-            {/* Pitch */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-300 font-medium">Pitch Offset</span>
-                <span className="font-mono-code text-indigo-400">{settings.pitch > 0 ? `+${settings.pitch}` : settings.pitch} st</span>
-              </div>
-              <input
-                type="range"
-                min="-12"
-                max="12"
-                step="1"
-                value={settings.pitch}
-                onChange={(e) => setSettings({ ...settings, pitch: parseInt(e.target.value, 10) })}
-                className="w-full accent-indigo-500 cursor-pointer"
-              />
-              <p className="text-[11px] text-slate-500">-12 to +12 semitones fundamental frequency transpose.</p>
-            </div>
-
-            {/* Speaker Boost */}
-            <div className="pt-2 border-t border-slate-800 flex items-center justify-between">
-              <div>
-                <div className="text-xs font-semibold text-slate-200">Speaker Boost</div>
-                <div className="text-[11px] text-slate-500">Boosts high-frequency clarity</div>
-              </div>
-              <input
-                type="checkbox"
-                checked={settings.speakerBoost}
-                onChange={(e) => setSettings({ ...settings, speakerBoost: e.target.checked })}
-                className="w-4 h-4 accent-indigo-500 rounded cursor-pointer"
-              />
-            </div>
           </div>
         </div>
       </div>

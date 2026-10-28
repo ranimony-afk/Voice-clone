@@ -1,0 +1,20 @@
+# VoiceForge OmniVoice worker. Long-lived GPU container; model loads once.
+# Build from a trusted registry mirror with HF access and captured model-card licenses.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 HF_HOME=/models/huggingface \
+    VOICEFORGE_HOST=0.0.0.0 VOICEFORGE_PORT=8100 NODE_ENV=production
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip python3-venv libsndfile1 ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY requirements.txt requirements.lock ./
+RUN pip install --upgrade pip && pip install -r requirements.lock
+# Install exact published upstream version; CUDA torch is installed separately
+# from the official PyTorch CUDA 12.8 index in the build environment.
+RUN pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0 torchaudio==2.8.0
+RUN pip install 'omnivoice==0.2.1'
+COPY app ./app
+EXPOSE 8100
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/healthz', timeout=3)"
+CMD ["python3", "-m", "app.main"]

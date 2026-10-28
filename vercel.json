@@ -1,0 +1,24 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "buildCommand": "npm run build:client",
+  "outputDirectory": "dist",
+  "installCommand": "npm ci",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://$VOICEFORGE_API_HOST/api/:path*" },
+    { "source": "/healthz", "destination": "https://$VOICEFORGE_API_HOST/healthz" },
+    { "source": "/readyz", "destination": "https://$VOICEFORGE_API_HOST/readyz" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        { "key": "Permissions-Policy", "value": "camera=(self), microphone=(self)" }
+      ]
+    }
+  ]
+}

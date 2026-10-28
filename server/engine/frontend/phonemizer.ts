@@ -3,9 +3,121 @@
  * Generates standardized IPA phoneme sequences across English, Hindi, Tamil, Malayalam, and Japanese
  */
 
-import { SupportedLanguage } from '../types.ts';
+import { DictionaryEntry, SupportedLanguage, WordPhonemeItem } from '../types.ts';
 
 export class Phonemizer {
+  // In-memory Personal Pronunciation Dictionary
+  private static dictionary: Map<string, DictionaryEntry> = new Map([
+    [
+      'all_voiceforge',
+      {
+        id: 'dict_seed_vf',
+        word: 'VoiceForge',
+        language: 'all',
+        ipa: 'vɔɪs.fɔːrd͡ʒ',
+        alias: 'Voice Forge',
+        notes: 'Brand canonical compound pronunciation',
+        createdAt: new Date().toISOString(),
+      },
+    ],
+    [
+      'en_api',
+      {
+        id: 'dict_seed_api',
+        word: 'API',
+        language: 'en',
+        ipa: 'eɪ.piː.aɪ',
+        alias: 'A P I',
+        notes: 'Initialism letter-by-letter expansion',
+        createdAt: new Date().toISOString(),
+      },
+    ],
+    [
+      'ta_டாக்டர்',
+      {
+        id: 'dict_seed_dr_ta',
+        word: 'டாக்டர்',
+        language: 'ta',
+        ipa: 'ɖaːk.ʈar',
+        alias: 'Doctor',
+        notes: 'Loanword retroflex plosive articulation',
+        createdAt: new Date().toISOString(),
+      },
+    ],
+    [
+      'hi_डॉक्टर',
+      {
+        id: 'dict_seed_dr_hi',
+        word: 'डॉक्टर',
+        language: 'hi',
+        ipa: 'ɖɔːk.ʈər',
+        alias: 'Doctor',
+        notes: 'Canda-bindu vowel [ɔː] preservation',
+        createdAt: new Date().toISOString(),
+      },
+    ],
+    [
+      'ml_ഡോക്ടർ',
+      {
+        id: 'dict_seed_dr_ml',
+        word: 'ഡോക്ടർ',
+        language: 'ml',
+        ipa: 'ɖɔːk.ʈər',
+        alias: 'Doctor',
+        notes: 'Loanword chillu-r ending',
+        createdAt: new Date().toISOString(),
+      },
+    ],
+  ]);
+
+  /**
+   * Retrieves all dictionary entries
+   */
+  public static getDictionary(): DictionaryEntry[] {
+    const unique = new Map<string, DictionaryEntry>();
+    for (const entry of this.dictionary.values()) {
+      unique.set(entry.id, entry);
+    }
+    return Array.from(unique.values());
+  }
+
+  /**
+   * Adds or updates a pronunciation dictionary entry
+   */
+  public static addOrUpdateDictionaryEntry(entry: DictionaryEntry): void {
+    const cleanWord = entry.word.toLowerCase().trim();
+    const key = `${entry.language}_${cleanWord}`;
+    this.dictionary.set(key, entry);
+    if (entry.language === 'all') {
+      this.dictionary.set(`all_${cleanWord}`, entry);
+    }
+  }
+
+  /**
+   * Removes an entry by ID
+   */
+  public static removeDictionaryEntry(id: string): boolean {
+    let deleted = false;
+    for (const [k, v] of Array.from(this.dictionary.entries())) {
+      if (v.id === id) {
+        this.dictionary.delete(k);
+        deleted = true;
+      }
+    }
+    return deleted;
+  }
+
+  /**
+   * Checks if word has an override in personal dictionary
+   */
+  public static getOverrideForWord(word: string, lang: SupportedLanguage): DictionaryEntry | undefined {
+    const clean = word.toLowerCase().replace(/[.,!?;:()[\]"']/g, '').trim();
+    if (!clean) return undefined;
+    const langKey = `${lang}_${clean}`;
+    const allKey = `all_${clean}`;
+    return this.dictionary.get(langKey) || this.dictionary.get(allKey);
+  }
+
   /**
    * Primary entry point: Maps normalized text to unified IPA phonemes
    */
@@ -15,20 +127,79 @@ export class Phonemizer {
   ): {
     ipa: string;
     ruleNotes: string[];
+    wordBreakdown: WordPhonemeItem[];
   } {
+    let baseResult: { ipa: string; ruleNotes: string[] };
+
     switch (lang) {
       case 'hi':
-        return this.phonemizeHindi(text);
+        baseResult = this.phonemizeHindi(text);
+        break;
       case 'ta':
-        return this.phonemizeTamil(text);
+        baseResult = this.phonemizeTamil(text);
+        break;
       case 'ml':
-        return this.phonemizeMalayalam(text);
+        baseResult = this.phonemizeMalayalam(text);
+        break;
       case 'ja':
-        return this.phonemizeJapanese(text);
+        baseResult = this.phonemizeJapanese(text);
+        break;
       case 'en':
       default:
-        return this.phonemizeEnglish(text);
+        baseResult = this.phonemizeEnglish(text);
+        break;
     }
+
+    // Now apply dictionary overrides per word
+    const words = text.split(/\s+/).filter(Boolean);
+    const wordBreakdown: WordPhonemeItem[] = [];
+    const notes = [...baseResult.ruleNotes];
+
+    const finalIpaWords: string[] = [];
+
+    for (const w of words) {
+      const cleanWord = w.replace(/[.,!?;:()[\]"']/g, '');
+      const override = this.getOverrideForWord(cleanWord, lang);
+
+      if (override) {
+        wordBreakdown.push({
+          word: w,
+          ipa: override.ipa,
+          language: lang,
+          isOverridden: true,
+          dictionaryId: override.id,
+        });
+        finalIpaWords.push(override.ipa);
+        notes.push(
+          `[Pronunciation Dictionary]: Word "${w}" mapped to custom phonemes /${override.ipa}/ (${override.notes || 'User override'})`
+        );
+      } else {
+        // Single word phonemization
+        let singleIpa = '';
+        switch (lang) {
+          case 'hi': singleIpa = this.phonemizeHindi(w).ipa; break;
+          case 'ta': singleIpa = this.phonemizeTamil(w).ipa; break;
+          case 'ml': singleIpa = this.phonemizeMalayalam(w).ipa; break;
+          case 'ja': singleIpa = this.phonemizeJapanese(w).ipa; break;
+          default: singleIpa = this.phonemizeEnglish(w).ipa; break;
+        }
+        wordBreakdown.push({
+          word: w,
+          ipa: singleIpa || w,
+          language: lang,
+          isOverridden: false,
+        });
+        finalIpaWords.push(singleIpa || w);
+      }
+    }
+
+    const unifiedIpa = finalIpaWords.join(' ');
+
+    return {
+      ipa: unifiedIpa || baseResult.ipa,
+      ruleNotes: notes,
+      wordBreakdown,
+    };
   }
 
   // --------------------------------------------------------------------------
